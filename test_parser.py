@@ -677,6 +677,55 @@ class TestSpecInvariants(unittest.TestCase):
             os.unlink(path)
 
 
+class TestCashLinkSemantics(unittest.TestCase):
+    """§5 describes the pairings it saw rather than stating a rule. Writing the
+    check showed the table was narrower than the data — Sell All and Sell Short
+    carry links too. These two invariants hold across all of them."""
+
+    def _linked(self, src_type, tgt_type, tgt_symbol="USD=CASH"):
+        path = _csv(
+            _snapshot("Main", "ACME"),
+            _row(Id="2", Symbol="ACME", Portfolio="Main", Type=src_type,
+                 Currency="USD",
+                 **{"Shares Owned": "1", "Cost Per Share": "1",
+                    "Last Traded Price": "10", "OutgoingCashLink": "4",
+                    "Transaction Date": "2024-01-01 GMT+0800"}),
+            _snapshot("Main", tgt_symbol, price="1", rid="3"),
+            _row(Id="4", Symbol=tgt_symbol, Portfolio="Main", Type=tgt_type,
+                 Currency="USD",
+                 **{"Shares Owned": "1", "Cost Per Share": "1",
+                    "Last Traded Price": "1",
+                    "Transaction Date": "2024-01-01 GMT+0800"}))
+        try:
+            return [c for c, _ in P.parse(path)[2].spec_deviations]
+        finally:
+            os.unlink(path)
+
+    def test_correct_pairings_are_silent(self):
+        self.assertEqual(self._linked("Buy", "Sell"), [])
+        self.assertEqual(self._linked("Sell", "Buy"), [])
+        self.assertEqual(self._linked("Sell All", "Buy"), [])
+
+    def test_wrong_direction_is_reported(self):
+        self.assertEqual(self._linked("Buy", "Buy"),
+                         ["§5 link direction matches the cash flow"])
+
+    def test_target_must_be_a_cash_block(self):
+        self.assertEqual(self._linked("Buy", "Sell", tgt_symbol="OTHER"),
+                         ["§5 a cash link points at a =CASH block"])
+
+    def test_display_symbol_should_be_empty(self):
+        path = _csv(_row(Id="1", Symbol="ACME", Portfolio="Main", Currency="USD",
+                         **{"Last Traded Price": "10", "Display Symbol": "ACME.US"}))
+        try:
+            _, _, problems = P.parse(path)
+            self.assertEqual([c for c, _ in problems.spec_deviations],
+                             ["§2 Display Symbol is empty in every export examined"])
+            self.assertFalse(problems)
+        finally:
+            os.unlink(path)
+
+
 class TestFloatingPointTolerance(unittest.TestCase):
 
     def test_a_decimal_position_closes_flat(self):
@@ -707,10 +756,22 @@ class TestPriceZeroIsNotOneThing(unittest.TestCase):
             os.unlink(path)
 
     def test_unparseable_price_is_not_billed_twice(self):
-        problems = self._parse("N/A")
-        self.assertEqual(len(problems.unparseable), 1)
-        self.assertEqual(problems.unpriced_positions, [],
-                         "already reported as unparseable")
+        for raw in ("N/A", "0.0.0"):
+            with self.subTest(raw=raw):
+                problems = self._parse(raw)
+                self.assertEqual(len(problems.unparseable), 1)
+                self.assertEqual(problems.unpriced_positions, [],
+                                 "already reported as unparseable")
+
+    def test_zero_is_recognised_however_it_is_written(self):
+        """The reason is decided by _num(), not by inspecting the string. A
+        separate string test missed "0,000" and "0e0" and double-billed
+        "0.0.0" — a second opinion on what counts as a number is a copy of the
+        parsing rules, and it drifted."""
+        for raw in ("0", "0.00", "0,000", "0e0", "+0", "-0.0"):
+            with self.subTest(raw=raw):
+                self.assertEqual(self._parse(raw).unpriced_positions,
+                                 [("Main", "ACME", 100.0, "explicit 0")])
 
     def test_blank_price_says_blank(self):
         problems = self._parse(None)

@@ -121,8 +121,16 @@ POSITION_OPENING_TYPES = frozenset({"Buy", "Sell Short"})
 
 # Share counts are binary floats, so a position closed in decimal parts does not
 # land on exactly 0: Buy 0.3, Sell 0.1, Sell 0.2 leaves -2.78e-17. An exact
-# `!= 0` test reads that as an open position. Nothing in this format carries
-# meaningful size below this threshold.
+# `!= 0` test reads that as an open position.
+#
+# ⚠ **1e-9 is an assumption, not a measurement.** It is comfortably above the
+# residue that decimal arithmetic produces at the magnitudes this format carries
+# (the example above is 1e-17, eight orders below) and comfortably below any
+# holding anyone tracks — but the app documents no precision, so there is no
+# derivation behind the exact figure. A genuine 5e-10 position would read as
+# flat. If you deal in sizes that small, or if a future export turns out to
+# carry more decimal places than observed here, change it: it is used only by
+# `Block.is_flat()`, so the blast radius is one method.
 POSITION_EPSILON = 1e-9
 
 _DATE_FORMAT = re.compile(r"^\d{4}-\d{2}-\d{2} GMT[+-]\d{4}$")
@@ -180,6 +188,23 @@ def _num(s, on_error=None):
             on_error(s)
         return 0.0
     return value
+
+
+def _zero_price_reason(raw):
+    """Why a price parsed to 0: "blank", "explicit 0", or None if unparseable.
+
+    Asks `_num()` rather than inspecting the string, because a second opinion on
+    what counts as a number is a copy of the parsing rules that will drift from
+    them. The string version missed "0,000" and "0e0" (both parse to zero) and
+    double-billed "0.0.0" as unparseable *and* an explicit zero.
+    """
+    if not raw.strip():
+        return "blank"
+    failed = []
+    _num(raw, on_error=failed.append)
+    if failed:
+        return None                     # already reported as unparseable
+    return "explicit 0"
 
 
 @dataclass
@@ -517,6 +542,10 @@ def parse(path):
             problems.malformed_rows.append((line_no, len(row)))
             continue
         all_ids.append((line_no, get(row, "Id")))
+        if get(row, "Display Symbol"):
+            problems.spec_deviations.append(
+                ("§2 Display Symbol is empty in every export examined",
+                 f"line {line_no}: {get(row, 'Display Symbol')!r}"))
         if not get(row, "Transaction Date"):
             blank = [c for c in ("Symbol", "Portfolio") if not get(row, c)]
             if blank:
@@ -607,12 +636,10 @@ def parse(path):
     # bill one mistake twice; blank means unknown; an explicit "0" is a claim the
     # file is making. The last two are worth saying, with which one it was.
     problems.unpriced_positions = [
-        (b.portfolio, b.symbol, b.net_shares(),
-         "blank" if not b.last_price_raw.strip() else "explicit 0")
-        for b in blocks
+        (b.portfolio, b.symbol, b.net_shares(), reason)
+        for b, reason in ((b, _zero_price_reason(b.last_price_raw)) for b in blocks)
         if b.has_snapshot and b.last_price == 0 and not b.is_flat()
-        and (not b.last_price_raw.strip()
-             or b.last_price_raw.strip().strip("+-").replace(".", "").strip("0") == "")]
+        and reason is not None]
 
     # §2 [Verified]: one price per symbol across the whole file. Break it and two
     # portfolios holding the same instrument value it differently — anyone summing
@@ -651,6 +678,29 @@ def parse(path):
     problems.cross_portfolio_links = [
         (src.id, src.portfolio, tgt.portfolio) for src, tgt in resolved
         if tgt is not None and src.portfolio != tgt.portfolio]
+
+    # §5's table describes the pairings it observed rather than stating a rule,
+    # and checking it showed the table is narrower than the data: eleven exports
+    # contain six source types, not the four listed (Sell All and Sell Short also
+    # carry links). Two things do hold across all 1798 of them, so those are what
+    # gets checked:
+    #   - the target is always a =CASH block
+    #   - a Buy source pairs with Sell CASH (money out); every other source pairs
+    #     with Buy CASH (money in)
+    for src, tgt in resolved:
+        if tgt is None:
+            continue
+        if not tgt.symbol.endswith("=CASH"):
+            problems.spec_deviations.append(
+                ("§5 a cash link points at a =CASH block",
+                 f"Id {src.id}: → {tgt.symbol} ({tgt.ttype})"))
+            continue
+        expected = "Sell" if src.ttype == "Buy" else "Buy"
+        if tgt.ttype != expected:
+            problems.spec_deviations.append(
+                ("§5 link direction matches the cash flow",
+                 f"Id {src.id}: {src.ttype} → {tgt.ttype} {tgt.symbol}, "
+                 f"expected {expected}"))
 
     return blocks, header, problems
 
@@ -795,8 +845,9 @@ def _report_problems(problems, prefix="⚠"):
     if problems.spec_deviations:
         from collections import Counter as _C
         grouped = _C(claim for claim, _ in problems.spec_deviations)
-        print(f"\nnote: {len(problems.spec_deviations)} row(s) deviate from what "
-              f"the specification records. No number is affected:")
+        rows = len({detail.split(":")[0] for _, detail in problems.spec_deviations})
+        print(f"\nnote: {len(problems.spec_deviations)} deviation(s) from what the "
+              f"specification records, across {rows} row(s). No number is affected:")
         for claim, count in grouped.most_common():
             first = next(d for c, d in problems.spec_deviations if c == claim)
             print(f"    {claim} — {count} row(s), first: {first}")

@@ -48,7 +48,7 @@ Every claim is tagged with how it is known:
 ## Quick start
 
 ```bash
-python3 -m unittest          # 75 tests
+python3 -m unittest          # 80 tests
 python3 msp_export_parser.py --self-test
 ```
 
@@ -387,12 +387,21 @@ confirmed against one usage pattern, not two. Treat it as weaker than the
 An `Id` pointing at the paired cash-side transaction. [Verified] The pairings that
 occur:
 
-| Security side | → Cash side |
-|---|---|
-| `Buy` a security | `Sell XXX=CASH` (cash out) |
-| `Sell` a security | `Buy XXX=CASH` (cash in) |
-| `Interest` on cash | `Buy XXX=CASH` |
-| `Dividend` on a security | `Buy XXX=CASH` |
+| Source side | → Cash side | Share of links |
+|---|---|---|
+| `Buy` a security | `Sell XXX=CASH` (cash out) | ~43% |
+| `Sell` a security | `Buy XXX=CASH` (cash in) | ~26% |
+| `Interest` on cash | `Buy XXX=CASH` | ~25% |
+| `Dividend` on a security | `Buy XXX=CASH` | ~5% |
+| `Sell All` a security | `Buy XXX=CASH` | <1% |
+| `Sell Short` a security | `Buy XXX=CASH` | <1% |
+
+Two things hold across every link observed, and are worth relying on more than
+the table itself: **the target is always a `=CASH` block**, and **a `Buy` source
+pairs with `Sell` cash while everything else pairs with `Buy` cash** — money out
+versus money in. The list of source types is a description of one sample; the
+last two rows were missing from an earlier version of this document until a
+check was written for it.
 
 **Both sides are always in the same portfolio.** No cross-portfolio pairing was
 observed in any export.
