@@ -48,7 +48,7 @@ Every claim is tagged with how it is known:
 ## Quick start
 
 ```bash
-python3 -m unittest          # 67 tests
+python3 -m unittest          # 75 tests
 python3 msp_export_parser.py --self-test
 ```
 
@@ -123,9 +123,10 @@ exit code.
 changed.** That same non-numeric `Commission` still reads as 0, so
 `Block.total_commission()` under-reports it. The exit code cannot express
 "correct in the way you probably care about, wrong in a way you might"; the
-accessor's docstring carries that warning instead, and `Problems` keeps the
-offending cells in `unparseable_incidental` for anyone computing something
-other than a position.
+accessor's docstring carries that warning, `Block.unreadable_commissions()`
+answers it without reaching into `Problems` at all, and the offending cells stay
+in `unparseable_incidental` for anyone computing something other than a
+position.
 
 The grading is by column rather than by each row's actual consequence — a bad
 `Cost Per Share` on a `Buy` affects nothing, since only `Split` reads it, and a
@@ -231,14 +232,14 @@ files.
 | `Currency` | [Verified] | The instrument's quote currency |
 | `Last Traded Price` | [Verified] | Price at export time. **The same symbol shares one price across the whole file**, regardless of which portfolio holds it |
 | `Shares Owned` | [Verified] | **Meaning depends on `Type`** (§4). It is not "shares currently held" — it is this row's quantity *or amount* |
-| `Cost Per Share` | [Verified] | Execution price for this row. On `Dividend` / `Interest` rows it is 0 or 1 and carries no information |
+| `Cost Per Share` | [Verified] | Execution price for this row. On `Dividend` / `Interest` rows it is **almost always** 0 or 1 and carries no information — one row in a real export held another value, so do not assume it |
 | `Commission` | [Verified] | Commission for this row. **Not guaranteed numeric** — percentage strings turn up here in real data (§8) |
 | `Transaction Date` | [Verified] | `YYYY-MM-DD GMT+HHMM`. **Empty means this is a snapshot row** |
 | `Transaction Time` | [Verified] | `HH:MM:SS` |
 | `Purchase Exchange Rate` | [Official] | Manual FX override for this transaction (instrument currency → home currency). Empty means the app's automatic rate was used |
 | `Purchase Exchange Currencies` | [Unconfirmed] | Added in the 20-column version; empty in all data examined |
 | `Type` | [Official]+[Verified] | Transaction type — see §4 |
-| `Accounting` | [Official] | Cost-basis method: `FIFO` (default) / `LIFO` / `Weighted Average` / `Specific Lots`. **Only appears on sell-side rows** |
+| `Accounting` | [Official]+[Verified] | Cost-basis method: `FIFO` (default) / `LIFO` / `Weighted Average` / `Specific Lots`. **Never on a row that only opens a position** (`Buy`, `Sell Short`) — which lot to draw from is a closing-side question. Wider than "sell-side" though: it also turns up on `Dividend` and `Interest` rows [Verified] |
 | `Accounting Execution Ids` | [Unconfirmed] | Lot identifiers used with `Specific Lots`. Almost always empty |
 | `Notes` | [Verified] | Free text. In practice this is where the *intent* of a transaction lives — FX conversion details, interest rates, roll arithmetic |
 | `OutgoingCashLink` | [Verified] | The `Id` of a paired cash transaction — see §5 |
@@ -347,8 +348,10 @@ check your own implementation against it.
 ### `Dividend` and `Interest` hold amounts, not share counts
 
 Neither type moves the position. `Shares Owned` carries a **cash amount** —
-positive for income, negative for an expense. `Cost Per Share` on these rows is 0
-or 1 and means nothing; do not multiply by it. [Verified]
+positive for income, negative for an expense. `Cost Per Share` on these rows is
+almost always 0 or 1 and means nothing; do not multiply by it. [Verified] One
+row out of nine hundred in a real export carried a different value, so treat
+"always" as "nearly always" and let your parser say something when it is not.
 
 Because the app has no dedicated field for fees, taxes, or futures roll
 differentials, a common convention is to book them as negative `Dividend` or
@@ -398,8 +401,8 @@ This matches the official UI strings: `withdrawCashFromPortfolioToPurchase`,
 `depositCashToPortfolioFromSale`, and `portfolio_link_cashFound` ("Linked cash
 transaction found").
 
-⚠ **Coverage is low.** In the sample, well under 5% of transactions carried a
-link — the cash leg of everything else was recorded by hand with no
+⚠ **Coverage is low.** In the most recent export, 247 of 6,888 transactions
+carried a link — 3.6% — the cash leg of everything else was recorded by hand with no
 machine-readable relationship. Any cash-flow analysis built on this column alone
 will see a small fraction of the actual flows.
 
@@ -480,7 +483,9 @@ surfaced a row from six months earlier that had simply been renumbered.
     can drift in the last places. If you extend this into money — cost basis,
     realised P&L, tax lots — switch to `decimal.Decimal`, which is what the app's
     own string representation implies anyway. The reference parser keeps `float`
-    to stay readable in one sitting. [Verified]
+    to stay readable in one sitting, and compares positions against a tolerance
+    rather than exact zero — `Buy 0.3, Sell 0.1, Sell 0.2` leaves −2.78e-17,
+    which an exact test reads as an open position. [Verified]
 12. **Number formatting is assumed to be `.` decimal separator, `,` thousands
     separator**, and **this cannot be fully checked from the file**. Whether an
     export made under a comma-decimal locale differs has not been tested — no

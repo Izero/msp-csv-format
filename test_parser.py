@@ -138,7 +138,7 @@ class TestDocumentedBehaviour(unittest.TestCase):
     def test_negative_value_reverses_the_direction(self):
         """§4 sign convention. abs() here would give 90 instead of 110."""
         self.assertEqual(self._net(
-            _snapshot("Main", "USD=CASH"),
+            _snapshot("Main", "USD=CASH", price="1"),
             _txn("Main", "USD=CASH", "Buy", 100, rid="2"),
             _txn("Main", "USD=CASH", "Sell", -10, rid="3")), 110.0)
 
@@ -398,7 +398,8 @@ class TestFailsLoudly(unittest.TestCase):
                     _txn("Main", "ACME", "Buy", 100, rid="2"))
         try:
             blocks, _, problems = P.parse(path)
-            self.assertEqual(problems.unpriced_positions, [("Main", "ACME", 100.0)])
+            self.assertEqual(problems.unpriced_positions,
+                             [("Main", "ACME", 100.0, "blank")])
             self.assertEqual(blocks[0].market_value(), 0.0)
             self.assertTrue(problems)
         finally:
@@ -438,6 +439,9 @@ class TestFailsLoudly(unittest.TestCase):
             self.assertEqual(len(problems.unparseable_incidental), 1)
             self.assertIn("unparseable_incidental",
                           P.Block.total_commission.__doc__)
+            self.assertEqual(blocks[0].unreadable_commissions(), ["2"],
+                             "an API caller must be able to find this without "
+                             "reaching into Problems")
         finally:
             os.unlink(path)
 
@@ -474,7 +478,7 @@ class TestFailsLoudly(unittest.TestCase):
             _row(Id="2", Symbol="ACME", Portfolio="A", Type="Buy", Currency="USD",
                  **{"Shares Owned": "1", "Cost Per Share": "1", "Last Traded Price": "10",
                     "Transaction Date": "2024-01-01 GMT+0800", "OutgoingCashLink": "4"}),
-            _snapshot("B", "USD=CASH", rid="3"),
+            _snapshot("B", "USD=CASH", price="1", rid="3"),
             _row(Id="4", Symbol="USD=CASH", Portfolio="B", Type="Sell", Currency="USD",
                  **{"Shares Owned": "1", "Cost Per Share": "1", "Last Traded Price": "1",
                     "Transaction Date": "2024-01-01 GMT+0800"}))
@@ -600,6 +604,123 @@ class TestStructuralIntegrity(unittest.TestCase):
             self.assertIn("not UTF-8", str(cm.exception))
         finally:
             os.unlink(path)
+
+
+class TestSpecInvariants(unittest.TestCase):
+    """Claims §2, §3 and §4 make, which the parser used to assume.
+
+    The self-audit was uneven: §1 and §5 got checked, these did not.
+    """
+
+    def test_one_price_per_symbol(self):
+        """§2 [Verified]. Break it and two portfolios value the same holding
+        differently — anyone summing across portfolios gets a wrong total."""
+        path = _csv(_row(Id="1", Symbol="ACME", Portfolio="Main", Currency="USD",
+                         **{"Last Traded Price": "65"}),
+                    _txn("Main", "ACME", "Buy", 100, rid="2"),
+                    _row(Id="3", Symbol="ACME", Portfolio="Other", Currency="USD",
+                         **{"Last Traded Price": "12"}),
+                    _txn("Other", "ACME", "Buy", 100, rid="4"))
+        try:
+            _, _, problems = P.parse(path)
+            self.assertEqual(problems.inconsistent_prices, [("ACME", [12.0, 65.0])])
+            self.assertTrue(problems)
+        finally:
+            os.unlink(path)
+
+    def test_cash_is_priced_at_par(self):
+        """§3 [Official]: a cash position's price is always 1. At 3 the block's
+        market value is triple the balance."""
+        path = _csv(_row(Id="1", Symbol="USD=CASH", Portfolio="Main", Currency="USD",
+                         **{"Last Traded Price": "3"}),
+                    _txn("Main", "USD=CASH", "Buy", 1000, rid="2"))
+        try:
+            blocks, _, problems = P.parse(path)
+            self.assertEqual(problems.cash_priced_off_par, [("Main", "USD=CASH", 3.0)])
+            self.assertEqual(blocks[0].market_value(), 3000.0)
+            self.assertTrue(problems)
+        finally:
+            os.unlink(path)
+
+    def test_accounting_on_an_opening_row_is_a_notice(self):
+        """Checking §2 against real data corrected the claim itself: Accounting
+        is not sell-side only — Dividend and Interest carry it too. What holds is
+        that rows which only open a position never do."""
+        path = _csv(_snapshot("Main", "ACME"),
+                    _row(Id="2", Symbol="ACME", Portfolio="Main", Type="Buy",
+                         Currency="USD", Accounting="FIFO",
+                         **{"Shares Owned": "1", "Cost Per Share": "1",
+                            "Last Traded Price": "10",
+                            "Transaction Date": "2024-01-01 GMT+0800"}))
+        try:
+            _, _, problems = P.parse(path)
+            self.assertEqual([c for c, _ in problems.spec_deviations],
+                             ["§2 Accounting appears on closing-side rows"])
+            self.assertFalse(problems)
+        finally:
+            os.unlink(path)
+
+    def test_date_and_cost_deviations_are_notices(self):
+        path = _csv(_snapshot("Main", "ACME"),
+                    _row(Id="2", Symbol="ACME", Portfolio="Main", Type="Dividend",
+                         Currency="USD",
+                         **{"Shares Owned": "5", "Cost Per Share": "89.7",
+                            "Last Traded Price": "10",
+                            "Transaction Date": "2024/01/01"}))
+        try:
+            _, _, problems = P.parse(path)
+            claims = {c for c, _ in problems.spec_deviations}
+            self.assertIn("§2 Transaction Date is 'YYYY-MM-DD GMT+HHMM'", claims)
+            self.assertIn("§4 Cost Per Share on Dividend/Interest is 0 or 1", claims)
+            self.assertFalse(problems)
+        finally:
+            os.unlink(path)
+
+
+class TestFloatingPointTolerance(unittest.TestCase):
+
+    def test_a_decimal_position_closes_flat(self):
+        """0.3 - 0.1 - 0.2 is -2.78e-17 in binary floating point. An exact
+        `!= 0` test reads that as an open position."""
+        path = _csv(_row(Id="1", Symbol="ACME", Portfolio="Main", Currency="USD"),
+                    _txn("Main", "ACME", "Buy", 0.3, rid="2"),
+                    _txn("Main", "ACME", "Sell", 0.1, rid="3"),
+                    _txn("Main", "ACME", "Sell", 0.2, rid="4"))
+        try:
+            blocks, _, problems = P.parse(path)
+            self.assertNotEqual(blocks[0].net_shares(), 0.0, "float residue is real")
+            self.assertTrue(blocks[0].is_flat(), "but the position is closed")
+            self.assertEqual(problems.unpriced_positions, [])
+        finally:
+            os.unlink(path)
+
+
+class TestPriceZeroIsNotOneThing(unittest.TestCase):
+
+    def _parse(self, price_cell):
+        row = ({"Last Traded Price": price_cell} if price_cell is not None else {})
+        path = _csv(_row(Id="1", Symbol="ACME", Portfolio="Main", Currency="USD", **row),
+                    _txn("Main", "ACME", "Buy", 100, rid="2"))
+        try:
+            return P.parse(path)[2]
+        finally:
+            os.unlink(path)
+
+    def test_unparseable_price_is_not_billed_twice(self):
+        problems = self._parse("N/A")
+        self.assertEqual(len(problems.unparseable), 1)
+        self.assertEqual(problems.unpriced_positions, [],
+                         "already reported as unparseable")
+
+    def test_blank_price_says_blank(self):
+        problems = self._parse(None)
+        self.assertEqual(problems.unpriced_positions,
+                         [("Main", "ACME", 100.0, "blank")])
+
+    def test_explicit_zero_says_so(self):
+        problems = self._parse("0")
+        self.assertEqual(problems.unpriced_positions,
+                         [("Main", "ACME", 100.0, "explicit 0")])
 
 
 class TestCommandLineExitCodes(unittest.TestCase):

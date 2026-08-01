@@ -112,6 +112,22 @@ REQUIRED_COLUMNS = (
 # and real exports genuinely contain non-numeric Commission cells (§8). Treating
 # those as errors would mean a healthy export never exits 0, which trains people
 # to ignore the exit code.
+# Types that only open a position. Deciding which lot to draw from is a
+# closing-side question, so an Accounting method here has nothing to act on.
+# (§2 used to say "sell-side only"; real exports also carry it on Dividend and
+# Interest rows, so the claim was narrower than the data. Opening rows are the
+# part that actually held up.)
+POSITION_OPENING_TYPES = frozenset({"Buy", "Sell Short"})
+
+# Share counts are binary floats, so a position closed in decimal parts does not
+# land on exactly 0: Buy 0.3, Sell 0.1, Sell 0.2 leaves -2.78e-17. An exact
+# `!= 0` test reads that as an open position. Nothing in this format carries
+# meaningful size below this threshold.
+POSITION_EPSILON = 1e-9
+
+_DATE_FORMAT = re.compile(r"^\d{4}-\d{2}-\d{2} GMT[+-]\d{4}$")
+_TIME_FORMAT = re.compile(r"^\d{2}:\d{2}:\d{2}$")
+
 POSITION_CRITICAL_COLUMNS = frozenset({
     "Shares Owned", "Cost Per Share", "Last Traded Price"})
 
@@ -194,6 +210,9 @@ class Block:
     exchange: str
     currency: str
     last_price: float
+    # The snapshot cell exactly as written, so callers can tell a blank price
+    # (unknown) from an explicit "0" from something unparseable.
+    last_price_raw: str = ""
     txns: list = field(default_factory=list)
     # False when transactions appeared with no snapshot row above them. Such a
     # block has no price, so every market value in it is 0 — worth knowing
@@ -225,6 +244,27 @@ class Block:
             # because a future app version adding a type would otherwise corrupt
             # positions with no signal at all.
         return qty
+
+    def is_flat(self):
+        """True when the position is zero within floating-point tolerance.
+
+        Use this rather than `net_shares() != 0`. Decimal share counts do not
+        close to exactly zero in binary floating point — see POSITION_EPSILON.
+        """
+        return abs(self.net_shares()) < POSITION_EPSILON
+
+    def unreadable_commissions(self):
+        """Ids whose Commission cell is present but cannot be read as a number.
+
+        Non-empty means `total_commission()` is understated, because those cells
+        read as 0. This exists so an API caller can find out without reaching
+        into `Problems`: the CLI prints a notice, an accessor cannot.
+        """
+        bad = []
+        for txn in self.txns:
+            _num(txn.raw.get("Commission", ""),
+                 on_error=lambda _raw, _t=txn: bad.append(_t.id))
+        return bad
 
     def unapplicable_splits(self):
         """`Split` rows whose ratio cannot be applied.
@@ -271,6 +311,7 @@ class Block:
         `problems.unparseable_incidental` before trusting the total.
         """
         return sum(t.commission for t in self.txns)
+        # See unreadable_commissions() for whether this total is complete.
 
     def market_value(self):
         """net_shares x last_price, in this block's own currency (no FX applied).
@@ -339,6 +380,8 @@ class Problems:
     orphan_blocks: list = field(default_factory=list)  # (portfolio, symbol)
     incomplete_snapshots: list = field(default_factory=list)  # (line, [fields])
     unpriced_positions: list = field(default_factory=list)  # (portfolio, symbol, net)
+    inconsistent_prices: list = field(default_factory=list)  # (symbol, [prices])
+    cash_priced_off_par: list = field(default_factory=list)  # (portfolio, symbol, price)
     unresolved_links: list = field(default_factory=list)  # (source_id, target_id)
 
     # --- notices: documented behaviour, or deviations that change nothing ---
@@ -347,6 +390,7 @@ class Problems:
     non_monotonic_ids: list = field(default_factory=list)  # (previous, current)
     non_numeric_ids: list = field(default_factory=list)  # (line, id)
     cross_portfolio_links: list = field(default_factory=list)  # (src_id, from, to)
+    spec_deviations: list = field(default_factory=list)  # (claim, detail)
 
     def __bool__(self):
         """True when something is actually *wrong*.
@@ -361,7 +405,8 @@ class Problems:
                     or self.unapplicable_splits or self.malformed_rows
                     or self.duplicate_ids or self.blank_ids
                     or self.orphan_blocks or self.unresolved_links
-                    or self.incomplete_snapshots or self.unpriced_positions)
+                    or self.incomplete_snapshots or self.unpriced_positions
+                    or self.inconsistent_prices or self.cash_priced_off_par)
 
     def summary(self):
         bits = []
@@ -382,6 +427,11 @@ class Problems:
                         f"an identifying field")
         if self.unpriced_positions:
             bits.append(f"{len(self.unpriced_positions)} position(s) with no price")
+        if self.inconsistent_prices:
+            bits.append(f"{len(self.inconsistent_prices)} symbol(s) priced "
+                        f"inconsistently")
+        if self.cash_priced_off_par:
+            bits.append(f"{len(self.cash_priced_off_par)} cash block(s) not priced at 1")
         if self.unresolved_links:
             bits.append(f"{len(self.unresolved_links)} unresolved cash link(s)")
         if self.malformed_rows:
@@ -481,6 +531,7 @@ def parse(path):
                 exchange=get(row, "Exchange"),
                 currency=get(row, "Currency"),
                 last_price=num(row, "Last Traded Price"),
+                last_price_raw=get(row, "Last Traded Price"),
             )
             blocks.append(current)
             continue
@@ -512,6 +563,22 @@ def parse(path):
                             last_price=0.0, has_snapshot=False)
             blocks.append(current)
             problems.orphan_blocks.append((txn.portfolio, txn.symbol))
+        if txn.accounting and txn.ttype in POSITION_OPENING_TYPES:
+            problems.spec_deviations.append(
+                ("§2 Accounting appears on closing-side rows",
+                 f"Id {txn.id}: {txn.ttype} carries {txn.accounting!r}"))
+        raw_date = txn.raw.get("Transaction Date", "")
+        if not _DATE_FORMAT.match(raw_date):
+            problems.spec_deviations.append(
+                ("§2 Transaction Date is 'YYYY-MM-DD GMT+HHMM'",
+                 f"Id {txn.id}: {raw_date!r}"))
+        if txn.time and not _TIME_FORMAT.match(txn.time):
+            problems.spec_deviations.append(
+                ("§2 Transaction Time is 'HH:MM:SS'", f"Id {txn.id}: {txn.time!r}"))
+        if txn.ttype in CASH_ONLY_TYPES and txn.cost not in (0.0, 1.0):
+            problems.spec_deviations.append(
+                ("§4 Cost Per Share on Dividend/Interest is 0 or 1",
+                 f"Id {txn.id}: {txn.cost}"))
         current.txns.append(txn)
 
     # §1 states Id uniqueness within a file as [Verified]. cash_links() trusts it
@@ -535,9 +602,34 @@ def parse(path):
     # reads like an answer. `has_snapshot` filters out the orphans, which have
     # their own bucket. This is likelier than a missing snapshot in practice:
     # delisted tickers and symbols the quote source dropped both go blank.
+    # Three ways a price can be 0, and they do not deserve the same treatment.
+    # An unparseable cell is already reported as such, so repeating it here would
+    # bill one mistake twice; blank means unknown; an explicit "0" is a claim the
+    # file is making. The last two are worth saying, with which one it was.
     problems.unpriced_positions = [
-        (b.portfolio, b.symbol, b.net_shares()) for b in blocks
-        if b.has_snapshot and b.last_price == 0 and b.net_shares() != 0]
+        (b.portfolio, b.symbol, b.net_shares(),
+         "blank" if not b.last_price_raw.strip() else "explicit 0")
+        for b in blocks
+        if b.has_snapshot and b.last_price == 0 and not b.is_flat()
+        and (not b.last_price_raw.strip()
+             or b.last_price_raw.strip().strip("+-").replace(".", "").strip("0") == "")]
+
+    # §2 [Verified]: one price per symbol across the whole file. Break it and two
+    # portfolios holding the same instrument value it differently — anyone summing
+    # across portfolios (which §8.6 already warns about for double counting) gets a
+    # wrong total with nothing to show for it.
+    by_symbol = defaultdict(set)
+    for b in blocks:
+        if b.last_price:
+            by_symbol[b.symbol].add(b.last_price)
+    problems.inconsistent_prices = [(s, sorted(v)) for s, v in by_symbol.items()
+                                    if len(v) > 1]
+
+    # §3 [Official]: a cash position's price is always 1. At any other value the
+    # block's market value is a multiple of the balance it is supposed to be.
+    problems.cash_priced_off_par = [
+        (b.portfolio, b.symbol, b.last_price) for b in blocks
+        if b.symbol.endswith("=CASH") and b.last_price not in (0.0, 1.0)]
 
     for b in blocks:
         for row_id in b.unapplicable_splits():
@@ -643,10 +735,25 @@ def _report_problems(problems, prefix="⚠"):
     if problems.unpriced_positions:
         n += len(problems.unpriced_positions)
         print(f"\n{prefix} {len(problems.unpriced_positions)} block(s) hold a "
-              f"non-zero position at a price of 0 — the snapshot row's "
-              f"'Last Traded Price' was blank, so their market value reads 0:")
-        for pf, sym, net in problems.unpriced_positions[:10]:
-            print(f"    {pf} / {sym}: net {net:,.4f} @ 0")
+              f"non-zero position at a price of 0, so their market value reads 0. "
+              f"'blank' means the snapshot cell was empty (unknown); "
+              f"'explicit 0' means the file states zero:")
+        for pf, sym, net, why in problems.unpriced_positions[:10]:
+            print(f"    {pf} / {sym}: net {net:,.4f}, price {why}")
+    if problems.inconsistent_prices:
+        n += len(problems.inconsistent_prices)
+        print(f"\n{prefix} {len(problems.inconsistent_prices)} symbol(s) carry more "
+              f"than one price in this file. §2 records one price per symbol; "
+              f"without it, summing a holding across portfolios is wrong:")
+        for sym, prices in problems.inconsistent_prices[:10]:
+            print(f"    {sym}: {', '.join(str(x) for x in prices)}")
+    if problems.cash_priced_off_par:
+        n += len(problems.cash_priced_off_par)
+        print(f"\n{prefix} {len(problems.cash_priced_off_par)} cash block(s) priced "
+              f"at something other than 1 (§3). Their market value is a multiple "
+              f"of the balance:")
+        for pf, sym, price in problems.cash_priced_off_par[:10]:
+            print(f"    {pf} / {sym} @ {price}")
     if problems.blank_ids:
         n += len(problems.blank_ids)
         print(f"\n{prefix} {len(problems.blank_ids)} row(s) have a blank Id. §1 "
@@ -685,6 +792,14 @@ def _report_problems(problems, prefix="⚠"):
             print(f"    Id {row_id} {col}: {raw!r}")
         if len(problems.unparseable_incidental) > 5:
             print(f"    ... and {len(problems.unparseable_incidental) - 5} more")
+    if problems.spec_deviations:
+        from collections import Counter as _C
+        grouped = _C(claim for claim, _ in problems.spec_deviations)
+        print(f"\nnote: {len(problems.spec_deviations)} row(s) deviate from what "
+              f"the specification records. No number is affected:")
+        for claim, count in grouped.most_common():
+            first = next(d for c, d in problems.spec_deviations if c == claim)
+            print(f"    {claim} — {count} row(s), first: {first}")
     if problems.non_numeric_ids:
         print(f"\nnote: {len(problems.non_numeric_ids)} Id(s) are not integers "
               f"(first: {problems.non_numeric_ids[0][1]!r} on line "
