@@ -315,6 +315,24 @@ class TestFailsLoudly(unittest.TestCase):
                 finally:
                     os.unlink(path)
 
+    def test_split_with_a_negative_side_is_reported(self):
+        """A truthiness guard lets -1 through: `Buy 100` then `Split 2:-1` used to
+        read as a 200-share SHORT, exit 0. Same phantom short §4 warns about,
+        different door. Both sides of the ratio must be positive."""
+        for shares, cost in [(2, "-1"), (-2, "1"), (-2, "-1"), (0, "1")]:
+            with self.subTest(shares=shares, cost=cost):
+                path = _csv(_snapshot("Main", "ACME"),
+                            _txn("Main", "ACME", "Buy", 100, rid="2"),
+                            _txn("Main", "ACME", "Split", shares, rid="3", cost=cost))
+                try:
+                    blocks, _, problems = P.parse(path)
+                    self.assertEqual(problems.unapplicable_splits,
+                                     [("3", "Main", "ACME")])
+                    self.assertEqual(blocks[0].net_shares(), 100.0,
+                                     "must not invert the position")
+                finally:
+                    os.unlink(path)
+
     def test_valid_split_is_not_reported(self):
         path = _csv(_snapshot("Main", "ACME"),
                     _txn("Main", "ACME", "Buy", 100, rid="2"),
@@ -355,6 +373,58 @@ class TestFailsLoudly(unittest.TestCase):
             _, _, problems = P.parse(path)
             self.assertEqual(problems.duplicate_pairs, [("Main", "ACME")])
             self.assertFalse(problems, "a duplicate pair alone must not be an error")
+        finally:
+            os.unlink(path)
+
+
+class TestStructuralIntegrity(unittest.TestCase):
+    """Claims §1 makes about the file's shape, which the parser relies on."""
+
+    def test_duplicate_ids_are_reported(self):
+        """§1 states Id uniqueness as [Verified] and cash_links() trusts it — a
+        dict keyed on Id keeps the last of any duplicates, silently."""
+        path = _csv(_snapshot("Main", "ACME", rid="1"),
+                    _txn("Main", "ACME", "Buy", 500, rid="9"),
+                    _txn("Main", "ACME", "Buy", 700, rid="9"))
+        try:
+            _, _, problems = P.parse(path)
+            self.assertEqual(problems.duplicate_ids, [("9", 2)])
+            self.assertTrue(problems)
+        finally:
+            os.unlink(path)
+
+    def test_short_row_is_skipped_and_reported(self):
+        """A short row's missing columns read as "", so an absent Transaction
+        Date turns it into a ghost block with an empty portfolio name."""
+        path = _csv(_snapshot("Main", "ACME"), '"2","ACME"')
+        try:
+            blocks, _, problems = P.parse(path)
+            self.assertEqual(len(blocks), 1, "no ghost block")
+            self.assertEqual([w for _, w in problems.malformed_rows], [2])
+        finally:
+            os.unlink(path)
+
+    def test_unresolved_cash_link_is_reported(self):
+        path = _csv(_snapshot("Main", "ACME"),
+                    _row(Id="2", Symbol="ACME", Portfolio="Main", Type="Buy",
+                         Currency="USD",
+                         **{"Shares Owned": "1", "Cost Per Share": "1",
+                            "Transaction Date": "2024-01-01 GMT+0800",
+                            "Last Traded Price": "10", "OutgoingCashLink": "999"}))
+        try:
+            _, _, problems = P.parse(path)
+            self.assertEqual(problems.unresolved_links, [("2", "999")])
+        finally:
+            os.unlink(path)
+
+    def test_non_utf8_file_raises(self):
+        fd, path = tempfile.mkstemp(suffix=".csv")
+        with os.fdopen(fd, "wb") as f:
+            f.write(HEADER.encode("utf-16"))
+        try:
+            with self.assertRaises(P.NotAnMspExport) as cm:
+                P.parse(path)
+            self.assertIn("not UTF-8", str(cm.exception))
         finally:
             os.unlink(path)
 
@@ -428,6 +498,22 @@ class TestCommandLineExitCodes(unittest.TestCase):
         r = self._run(path)
         self.assertEqual(r.returncode, 1)
         self.assertIn("undefined ratio", r.stdout)
+
+    def test_directory_argument_exits_two(self):
+        """The exit-code table promises 2 for unreadable input; a directory
+        raises IsADirectoryError, not FileNotFoundError."""
+        r = self._run(HERE)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("cannot read", r.stderr)
+
+    def test_non_utf8_exits_two(self):
+        fd, path = tempfile.mkstemp(suffix=".csv")
+        with os.fdopen(fd, "wb") as f:
+            f.write(HEADER.encode("utf-16"))
+        self.addCleanup(os.unlink, path)
+        r = self._run(path)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not UTF-8", r.stderr)
 
     def test_duplicate_pair_alone_exits_zero(self):
         path = self._tmp(_snapshot("Main", "ACME", rid="1"),

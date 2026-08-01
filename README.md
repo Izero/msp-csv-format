@@ -48,7 +48,7 @@ Every claim is tagged with how it is known:
 ## Quick start
 
 ```bash
-python3 -m unittest          # 42 tests
+python3 -m unittest          # 49 tests
 python3 msp_export_parser.py --self-test
 ```
 
@@ -189,7 +189,7 @@ files.
 | `Last Traded Price` | [Verified] | Price at export time. **The same symbol shares one price across the whole file**, regardless of which portfolio holds it |
 | `Shares Owned` | [Verified] | **Meaning depends on `Type`** (§4). It is not "shares currently held" — it is this row's quantity *or amount* |
 | `Cost Per Share` | [Verified] | Execution price for this row. On `Dividend` / `Interest` rows it is 0 or 1 and carries no information |
-| `Commission` | [Verified] | Commission for this row |
+| `Commission` | [Verified] | Commission for this row. **Not guaranteed numeric** — percentage strings turn up here in real data (§8) |
 | `Transaction Date` | [Verified] | `YYYY-MM-DD GMT+HHMM`. **Empty means this is a snapshot row** |
 | `Transaction Time` | [Verified] | `HH:MM:SS` |
 | `Purchase Exchange Rate` | [Official] | Manual FX override for this transaction (instrument currency → home currency). Empty means the app's automatic rate was used |
@@ -439,14 +439,24 @@ surfaced a row from six months earlier that had simply been renumbered.
     own string representation implies anyway. The reference parser keeps `float`
     to stay readable in one sitting. [Verified]
 12. **Number formatting is assumed to be `.` decimal separator, `,` thousands
-    separator.** Whether an export made under a comma-decimal locale differs has
-    not been checked — no such device was available. [Unconfirmed] The reference
-    parser no longer *assumes* silently: a comma is accepted only where a
-    thousands separator can go (followed by exactly three digits), so `1,234`
-    parses and `1,5` is reported instead of becoming `15`. That converts an
-    undetectable tenfold error into a visible one, but it does not tell you what
-    the value should have been. To settle the question: switch the device locale,
+    separator**, and **this cannot be fully checked from the file**. Whether an
+    export made under a comma-decimal locale differs has not been tested — no
+    such device was available. [Unconfirmed]
+
+    The reference parser catches the *unambiguous* half: a comma is accepted only
+    where a thousands separator can go (followed by exactly three digits), so
+    `1,5` is reported rather than silently becoming `15`. **The ambiguous half is
+    undetectable.** `1,234` is one thousand two hundred and thirty-four here, and
+    would be one-point-two-three-four under a comma-decimal locale; nothing in a
+    single value distinguishes them, and a whole-file heuristic only works if the
+    file happens to contain a counter-example. If you are on such a locale, verify
+    before trusting any number here. To settle it: switch the device locale,
     re-export, and diff against a known file.
+13. **`Commission` is not always a number.** In one real export a handful of
+    `Commission` cells held a percentage string (`5%`, `0.5%`) rather than an
+    amount — presumably a rate recorded where a fee was expected. The app accepts
+    it; anything parsing the column has to decide what to do with it. The
+    reference parser reports these rather than reading them as zero. [Verified]
 
 ## Official references
 

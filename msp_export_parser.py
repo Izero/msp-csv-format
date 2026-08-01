@@ -125,10 +125,11 @@ def _num(s, on_error=None):
     mode this specification spends its length warning about, so the two are kept
     apart: `on_error` is called with the raw value when a non-empty cell fails.
 
-    Assumes "." decimal separator and "," thousands separator. A comma in any
-    other position is rejected rather than stripped, so an export written under
-    a comma-decimal locale reports instead of returning a number ten or a
-    hundred times too large. See README §8.
+    Assumes "." decimal separator and "," thousands separator, and catches only
+    the unambiguous half of that assumption: a comma somewhere a thousands
+    separator cannot go ("1,5") is rejected rather than stripped. A comma where
+    one *can* go is indistinguishable — "1,234" is 1234 here and 1.234 under a
+    comma-decimal locale, and no single value tells you which. See README §8.
     """
     s = (s or "").strip()
     if not s:
@@ -199,7 +200,7 @@ class Block:
             elif t.ttype in FLATTEN_TYPES:
                 qty = 0.0                       # unconditional; ignore t.shares
             elif t.ttype in SPLIT_TYPES:
-                if t.cost:
+                if t.shares > 0 and t.cost > 0:
                     qty = qty * t.shares / t.cost
                 # else: undefined ratio. Left alone here and reported by
                 # `unapplicable_splits()` — see that method for why skipping
@@ -215,13 +216,20 @@ class Block:
     def unapplicable_splits(self):
         """`Split` rows whose ratio cannot be applied — blank or zero denominator.
 
-        `shares:cost = new:old`, so a `Cost Per Share` of 0 (which is also what a
-        blank cell parses to) makes the ratio undefined. Guarding against the
-        division by skipping the row leaves the position at its pre-split value:
-        a plausible number, no error, no way to tell. `Split` is one of only two
-        order-sensitive types in the format, which makes silence here expensive.
+`shares:cost = new:old`. **Both sides have to be positive.** Zero or blank
+        makes the ratio undefined; a negative on either side makes it *inverted*,
+        which is worse — a truthiness guard lets `-1` through and turns a 100
+        share long into a 200 share short, exit 0, no output. That is the same
+        phantom short position §4 warns about, arriving through a different door,
+        and negative values are not far-fetched in this format (see the sign
+        convention).
+
+        Skipping quietly is the wrong response either way: it leaves the position
+        at its pre-split value, a plausible number with nothing attached. `Split`
+        is one of only two order-sensitive types, which makes silence expensive.
         """
-        return [t.id for t in self.txns if t.ttype in SPLIT_TYPES and not t.cost]
+        return [t.id for t in self.txns
+                if t.ttype in SPLIT_TYPES and not (t.shares > 0 and t.cost > 0)]
 
     def unknown_types(self):
         """Transaction types in this block that the parser cannot act on.
@@ -284,6 +292,9 @@ class Problems:
     unparseable: list = field(default_factory=list)   # (row_id, column, raw_value)
     unknown_types: dict = field(default_factory=dict)  # type name -> row count
     unapplicable_splits: list = field(default_factory=list)  # (row_id, portfolio, symbol)
+    duplicate_ids: list = field(default_factory=list)   # (id, occurrences)
+    unresolved_links: list = field(default_factory=list)  # (source_id, target_id)
+    malformed_rows: list = field(default_factory=list)  # (line_number, cell_count)
     duplicate_pairs: list = field(default_factory=list)  # (portfolio, symbol)
 
     def __bool__(self):
@@ -296,7 +307,8 @@ class Problems:
         file containing one is not a bad file.
         """
         return bool(self.unparseable or self.unknown_types
-                    or self.unapplicable_splits)
+                    or self.unapplicable_splits or self.duplicate_ids
+                    or self.malformed_rows or self.unresolved_links)
 
     def summary(self):
         bits = []
@@ -306,6 +318,12 @@ class Problems:
             bits.append(f"{len(self.unknown_types)} unrecognised transaction type(s)")
         if self.unapplicable_splits:
             bits.append(f"{len(self.unapplicable_splits)} split(s) with an undefined ratio")
+        if self.duplicate_ids:
+            bits.append(f"{len(self.duplicate_ids)} duplicated Id(s)")
+        if self.unresolved_links:
+            bits.append(f"{len(self.unresolved_links)} unresolved cash link(s)")
+        if self.malformed_rows:
+            bits.append(f"{len(self.malformed_rows)} row(s) of the wrong width")
         return "; ".join(bits) or "none"
 
 
@@ -323,13 +341,21 @@ def parse(path):
     that order matched `Transaction Date` order exactly, but the app does not
     document any ordering guarantee. See README §1. [Unconfirmed]
     """
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.reader(f)
-        try:
-            header = [h.strip() for h in next(reader)]
-        except StopIteration:
-            raise NotAnMspExport(f"{path} is empty — no header row") from None
-        rows = list(reader)
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            try:
+                header = [h.strip() for h in next(reader)]
+            except StopIteration:
+                raise NotAnMspExport(f"{path} is empty — no header row") from None
+            rows = list(reader)
+    except UnicodeDecodeError as exc:
+        # The exit-code contract promises 2 for unreadable input; without this
+        # a UTF-16 file gave a traceback instead.
+        raise NotAnMspExport(
+            f"{path} is not UTF-8 text ({exc.reason} at byte {exc.start}). "
+            f"MSP writes UTF-8; another encoding means this is either not an "
+            f"export or was re-saved by something else.") from None
 
     missing = [c for c in REQUIRED_COLUMNS if c not in header]
     if missing:
@@ -354,9 +380,17 @@ def parse(path):
 
     blocks = []
     current = None
-    for row in rows:
+    all_ids = []
+    for line_no, row in enumerate(rows, start=2):   # header is line 1
         if not row or not any(cell.strip() for cell in row):
             continue                            # block separator; width varies
+        if len(row) != len(header):
+            # A short row is not harmless: `get()` resolves the missing columns
+            # to "", so an absent "Transaction Date" makes the row look like a
+            # snapshot and it becomes a ghost block with an empty portfolio name.
+            problems.malformed_rows.append((line_no, len(row)))
+            continue
+        all_ids.append(get(row, "Id"))
         if not get(row, "Transaction Date"):
             current = Block(
                 portfolio=get(row, "Portfolio"),
@@ -394,6 +428,12 @@ def parse(path):
             blocks.append(current)
         current.txns.append(txn)
 
+    # §1 states Id uniqueness within a file as [Verified]. cash_links() trusts it
+    # — a dict keyed on Id silently keeps the last of any duplicates — so a file
+    # that breaks the claim is not the thing the specification describes.
+    problems.duplicate_ids = [(i, n) for i, n in Counter(all_ids).items()
+                              if n > 1 and i]
+
     for b in blocks:
         for row_id in b.unapplicable_splits():
             problems.unapplicable_splits.append((row_id, b.portfolio, b.symbol))
@@ -402,6 +442,11 @@ def parse(path):
                 1 for t in b.txns if t.ttype == ttype)
     problems.duplicate_pairs = [k for k, n in Counter(
         (b.portfolio, b.symbol) for b in blocks).items() if n > 1]
+    # §5 and §7 record every link in the sample resolving inside its own file.
+    # One that does not means the pairing data is incomplete — it does not move
+    # a position, but it is not the format behaving as documented either.
+    problems.unresolved_links = [(src.id, src.cash_link)
+                                 for src, tgt in cash_links(blocks) if tgt is None]
 
     return blocks, header, problems
 
@@ -454,6 +499,27 @@ def _report_problems(problems, prefix="⚠"):
               f"applied, so the position is stuck at its pre-split value:")
         for row_id, pf, sym in problems.unapplicable_splits[:10]:
             print(f"    Id {row_id}: {pf} / {sym}")
+    if problems.malformed_rows:
+        n += len(problems.malformed_rows)
+        print(f"\n{prefix} {len(problems.malformed_rows)} row(s) whose cell count "
+              f"does not match the header — SKIPPED, because a short row's missing "
+              f"columns read as empty and turn it into a ghost block:")
+        for line_no, width in problems.malformed_rows[:10]:
+            print(f"    line {line_no}: {width} cell(s)")
+    if problems.unresolved_links:
+        n += len(problems.unresolved_links)
+        print(f"\n{prefix} {len(problems.unresolved_links)} OutgoingCashLink value(s) "
+              f"point at an Id that is not in this file. Positions are unaffected, "
+              f"but the cash pairing is incomplete (§5):")
+        for src_id, target in problems.unresolved_links[:10]:
+            print(f"    Id {src_id} → {target!r} (not found)")
+    if problems.duplicate_ids:
+        n += len(problems.duplicate_ids)
+        print(f"\n{prefix} {len(problems.duplicate_ids)} duplicated Id(s). §1 states "
+              f"Id is unique within a file, and OutgoingCashLink resolution relies "
+              f"on it — a duplicate means links may resolve to the wrong row:")
+        for row_id, count in problems.duplicate_ids[:10]:
+            print(f"    Id {row_id!r}: {count} rows")
     if problems.unknown_types:
         n += len(problems.unknown_types)
         print(f"\n{prefix} {len(problems.unknown_types)} unrecognised transaction "
@@ -548,8 +614,11 @@ def main():
 
     try:
         blocks, header, problems = parse(ns.path)
-    except FileNotFoundError:
-        print(f"error: no such file: {ns.path}", file=sys.stderr)
+    except OSError as exc:
+        # Not just FileNotFoundError: a directory raises IsADirectoryError, an
+        # unreadable file raises PermissionError, and the exit-code contract
+        # promises 2 for all of them.
+        print(f"error: cannot read {ns.path}: {exc.strerror or exc}", file=sys.stderr)
         sys.exit(2)
     except NotAnMspExport as exc:
         print(f"error: {exc}", file=sys.stderr)
