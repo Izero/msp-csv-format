@@ -1,0 +1,17 @@
+msp-csv-format
+Copyright 2026 Izero
+
+This product contains an unofficial specification of the CSV export format used
+by My Stocks Portfolio & Market, together with an independently written reference
+parser for that format.
+
+"My Stocks Portfolio", "MSP", and "Peeksoft" are trademarks of their respective
+owners. This project is not affiliated with, endorsed by, sponsored by, or
+supported by Peeksoft LLC. Those names appear here solely to identify the file
+format this project reads.
+
+The specification was derived entirely from CSV files exported by the
+application's own export feature, from the author's own account, containing only
+the author's own data, together with the vendor's publicly published help pages
+and translation strings. No application binary was decompiled or disassembled,
+and no code or assets from the application are reproduced here.
