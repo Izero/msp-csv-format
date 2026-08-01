@@ -2,7 +2,7 @@
 """Reference parser for the CSV export of My Stocks Portfolio & Market (MSP).
 
 This is a *reference implementation* of the format described in README.md. It is
-deliberately small and dependency-free (Python 3.8+, standard library only) so it
+deliberately small and dependency-free (Python 3.9+, standard library only) so it
 can be read in one sitting and copied into any project.
 
 What it does:
@@ -82,6 +82,22 @@ CASH_ONLY_TYPES = {"Dividend", "Interest"}
 # Ratio adjustment. shares:cost = new:old (shares=2, cost=1 means a 2-for-1 split).
 SPLIT_TYPES = {"Split"}
 
+# Every type this parser knows how to act on. A type outside this set is not
+# "harmless extra data" — it means the file contains an instruction the parser
+# cannot follow, and every position derived from that block is suspect.
+KNOWN_TYPES = set(QTY_SIGN) | FLATTEN_TYPES | CASH_ONLY_TYPES | SPLIT_TYPES
+
+# Columns without which the file cannot be an MSP export. Resolving a missing
+# column to "" (which is what a name-based lookup naturally does) turns a wrong
+# file into a plausible-looking empty portfolio, exit code 0 and all — the exact
+# silent failure this specification is about.
+REQUIRED_COLUMNS = ("Id", "Symbol", "Portfolio", "Type",
+                    "Shares Owned", "Transaction Date")
+
+
+class NotAnMspExport(ValueError):
+    """The file is missing columns an MSP export always has."""
+
 
 def _num(s, on_error=None):
     """Parse a numeric cell.
@@ -151,8 +167,21 @@ class Block:
             elif t.ttype in SPLIT_TYPES:
                 if t.cost:
                     qty = qty * t.shares / t.cost
-            # CASH_ONLY_TYPES deliberately do nothing here
+            elif t.ttype in CASH_ONLY_TYPES:
+                pass                            # amounts, not quantities
+            # else: an unrecognised type. Deliberately does NOT fall through
+            # silently — `unknown_types()` reports it and `parse()` collects it,
+            # because a future app version adding a type would otherwise corrupt
+            # positions with no signal at all.
         return qty
+
+    def unknown_types(self):
+        """Transaction types in this block that the parser cannot act on.
+
+        Non-empty means `net_shares()` skipped rows, so the position it returns
+        is missing whatever those rows were supposed to do.
+        """
+        return sorted({t.ttype for t in self.txns if t.ttype not in KNOWN_TYPES})
 
     def cash_flow_by_type(self):
         """Sum the cash-only types. Their "Shares Owned" column holds an amount."""
@@ -194,13 +223,43 @@ class Block:
         return "security"
 
 
-def parse(path):
-    """Parse an MSP export. Returns (blocks, header, warnings). Blocks keep file order.
+@dataclass
+class Problems:
+    """Everything the parser noticed but could not fix.
 
-    `warnings` is a list of `(row_id, column, raw_value)` for cells that were
-    present but could not be parsed as a number. An empty list is the healthy
-    state. Anything in it means a value was replaced by 0.0, so some derived
-    position may be wrong — surface it rather than letting it pass.
+    Empty is the healthy state. Anything here means some position may be wrong,
+    and the caller has to decide what to do about it. The point of collecting
+    these rather than swallowing them is that all three failure modes below are
+    otherwise completely silent — the file parses, exit code is 0, and the
+    numbers are simply incorrect.
+    """
+    unparseable: list = field(default_factory=list)   # (row_id, column, raw_value)
+    unknown_types: dict = field(default_factory=dict)  # type name -> row count
+    duplicate_pairs: list = field(default_factory=list)  # (portfolio, symbol)
+
+    def __bool__(self):
+        return bool(self.unparseable or self.unknown_types or self.duplicate_pairs)
+
+    def summary(self):
+        bits = []
+        if self.unparseable:
+            bits.append(f"{len(self.unparseable)} unparseable numeric cell(s)")
+        if self.unknown_types:
+            bits.append(f"{len(self.unknown_types)} unrecognised transaction type(s)")
+        if self.duplicate_pairs:
+            bits.append(f"{len(self.duplicate_pairs)} duplicated (Portfolio, Symbol) pair(s)")
+        return "; ".join(bits) or "none"
+
+
+def parse(path):
+    """Parse an MSP export. Returns (blocks, header, problems). Blocks keep file order.
+
+    Raises `NotAnMspExport` if the file is empty or lacks columns every export
+    has. Without that check a three-column CSV parses "successfully" into a set
+    of empty positions and exits 0.
+
+    `problems` is a `Problems` instance — see that class. Check it. An empty
+    `Problems` is the only state in which the returned positions can be trusted.
 
     **Rows within a block are replayed in file order.** In every export examined
     that order matched `Transaction Date` order exactly, but the app does not
@@ -208,11 +267,22 @@ def parse(path):
     """
     with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.reader(f)
-        header = [h.strip() for h in next(reader)]
+        try:
+            header = [h.strip() for h in next(reader)]
+        except StopIteration:
+            raise NotAnMspExport(f"{path} is empty — no header row") from None
         rows = list(reader)
 
+    missing = [c for c in REQUIRED_COLUMNS if c not in header]
+    if missing:
+        raise NotAnMspExport(
+            f"{path} does not look like an MSP export. Missing column(s): "
+            f"{', '.join(missing)}. Found {len(header)} column(s): "
+            f"{', '.join(header) if header else '(none)'}")
+
     idx = {name: i for i, name in enumerate(header)}
-    warnings = []
+    problems = Problems()
+    warnings = problems.unparseable
 
     def get(row, name):
         i = idx.get(name)
@@ -266,7 +336,14 @@ def parse(path):
             blocks.append(current)
         current.txns.append(txn)
 
-    return blocks, header, warnings
+    for b in blocks:
+        for ttype in b.unknown_types():
+            problems.unknown_types[ttype] = problems.unknown_types.get(ttype, 0) + sum(
+                1 for t in b.txns if t.ttype == ttype)
+    problems.duplicate_pairs = [k for k, n in Counter(
+        (b.portfolio, b.symbol) for b in blocks).items() if n > 1]
+
+    return blocks, header, problems
 
 
 def by_portfolio(blocks):
@@ -295,33 +372,79 @@ EXPECTED_SELF_TEST = {
     ("Main", "USD=CASH"): -4956.0,  # -5001 + 45; Interest does not move shares
     ("Margin", "EURUSD=X"): -70250.0,  # short 100000, +(-250) capitalised, cover 30000
     ("Main", "^GSPC"): 250.0,       # Dividend (roll cost) does not move shares
+    ("Margin", "CHFUSD=X"): 0.0,    # Buy to Cover All with shares=0 must still flatten
 }
 
 
+def _report_problems(problems, prefix="⚠"):
+    """Print whatever the parser could not resolve. Returns the number of issues."""
+    n = 0
+    if problems.unparseable:
+        n += len(problems.unparseable)
+        print(f"\n{prefix} {len(problems.unparseable)} numeric cell(s) present but "
+              f"unparseable — each became 0.0, so some position below may be wrong:")
+        for row_id, col, raw in problems.unparseable[:10]:
+            print(f"    Id {row_id} column {col!r}: {raw!r}")
+        if len(problems.unparseable) > 10:
+            print(f"    ... and {len(problems.unparseable) - 10} more")
+    if problems.unknown_types:
+        n += len(problems.unknown_types)
+        print(f"\n{prefix} {len(problems.unknown_types)} unrecognised transaction "
+              f"type(s). Rows of these types were SKIPPED, so the positions below "
+              f"are missing whatever they were meant to do:")
+        for ttype, count in sorted(problems.unknown_types.items()):
+            print(f"    {ttype!r}: {count} row(s)")
+        print("    If the app added a type, this parser is out of date.")
+    if problems.duplicate_pairs:
+        n += len(problems.duplicate_pairs)
+        print(f"\n{prefix} {len(problems.duplicate_pairs)} (Portfolio, Symbol) pair(s) "
+              f"occupy more than one block. Anything that keys on the pair rather "
+              f"than iterating blocks will lose a position (README §8):")
+        for pf, sym in problems.duplicate_pairs[:5]:
+            print(f"    {pf} / {sym}")
+    return n
+
+
 def self_test():
+    """Smoke test against the bundled synthetic export. See test_parser.py for the
+    full unittest suite; this exists so `--self-test` works with no test runner."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "example-export.csv")
     if not os.path.exists(path):
         print(f"example-export.csv not found next to this script ({path})")
         return 1
-    blocks, header, warnings = parse(path)
+    try:
+        blocks, header, problems = parse(path)
+    except NotAnMspExport as exc:
+        print(f"FAIL {exc}")
+        return 1
+
     print(f"parsed {len(blocks)} blocks, {sum(len(b.txns) for b in blocks)} transactions, "
           f"{len(header)} columns\n")
     failures = 0
+    seen = set()
     for b in blocks:
         want = EXPECTED_SELF_TEST.get((b.portfolio, b.symbol))
         got = b.net_shares()
         ok = want is not None and abs(got - want) < 1e-9
         failures += 0 if ok else 1
+        seen.add((b.portfolio, b.symbol))
         print(f"  {'ok  ' if ok else 'FAIL'} {b.portfolio:8s} {b.symbol:10s} "
-              f"net={got:>12,.2f}" + ("" if ok else f"  expected {want:,.2f}"))
-    # A synthetic file must parse cleanly. Counting warnings as failures keeps
-    # example-export.csv from rotting unnoticed.
-    if warnings:
-        print(f"\n  FAIL {len(warnings)} unparseable numeric cell(s):")
-        for row_id, col, raw in warnings[:10]:
-            print(f"       Id {row_id} column {col!r}: {raw!r}")
-        failures += len(warnings)
+              f"net={got:>12,.2f}" + ("" if ok else f"  expected {want}"))
 
+    # Iterating only the blocks that showed up means a truncated file passes:
+    # four of five blocks could vanish and every remaining one still checks out.
+    for key in sorted(set(EXPECTED_SELF_TEST) - seen):
+        failures += 1
+        print(f"  FAIL {key[0]:8s} {key[1]:10s} block missing entirely")
+
+    # The synthetic file must also exercise every documented transaction type,
+    # or the README's claim that it does becomes false without anyone noticing.
+    present = {t.ttype for b in blocks for t in b.txns}
+    for missing in sorted(KNOWN_TYPES - present):
+        failures += 1
+        print(f"  FAIL type {missing!r} never appears in the example")
+
+    failures += _report_problems(problems, prefix="  FAIL")
     print("\nall expectations met" if not failures else f"\n{failures} failure(s)")
     return 1 if failures else 0
 
@@ -330,29 +453,49 @@ def main():
     args = sys.argv[1:]
     if "--self-test" in args:
         sys.exit(self_test())
-    if not args:
+    if not args or args[0].startswith("-"):
         print(__doc__)
         sys.exit(1)
 
     path = args[0]
-    blocks, header, warnings = parse(path)
+    try:
+        blocks, header, problems = parse(path)
+    except FileNotFoundError:
+        print(f"error: no such file: {path}", file=sys.stderr)
+        sys.exit(2)
+    except NotAnMspExport as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
 
-    if "--raw" in args:
-        i = args.index("--raw")
-        pf, sym = args[i + 1], args[i + 2]
-        for b in blocks:
-            if b.portfolio == pf and b.symbol == sym:
-                print(f"[{b.portfolio}/{b.symbol}] {b.name} "
-                      f"currency={b.currency} last={b.last_price}")
-                for t in b.txns:
-                    print(f"  {t.id:>5s} {t.date} {t.ttype:18s} "
-                          f"shares={t.shares:>16,.4f} cost={t.cost:>12,.4f} "
-                          f"comm={t.commission:>8,.2f} {t.notes[:48]!r}")
-                print(f"  => net_shares={b.net_shares():,.4f}  "
-                      f"market_value={b.market_value():,.2f} {b.currency}")
+    def opt(flag, count=1):
+        if flag not in args:
+            return None
+        i = args.index(flag)
+        if i + count >= len(args):
+            print(f"error: {flag} needs {count} argument(s)", file=sys.stderr)
+            sys.exit(2)
+        return args[i + 1:i + 1 + count]
+
+    raw = opt("--raw", 2)
+    if raw:
+        pf, sym = raw
+        hits = [b for b in blocks if (b.portfolio, b.symbol) == (pf, sym)]
+        if not hits:
+            print(f"error: no block for {pf} / {sym}", file=sys.stderr)
+            sys.exit(2)
+        for b in hits:
+            print(f"[{b.portfolio}/{b.symbol}] {b.name} "
+                  f"currency={b.currency} last={b.last_price}")
+            for t in b.txns:
+                print(f"  {t.id:>5s} {t.date} {t.ttype:18s} "
+                      f"shares={t.shares:>16,.4f} cost={t.cost:>12,.4f} "
+                      f"comm={t.commission:>8,.2f} {t.notes[:48]!r}")
+            print(f"  => net_shares={b.net_shares():,.4f}  "
+                  f"market_value={b.market_value():,.2f} {b.currency}")
         return
 
-    only = args[args.index("--portfolio") + 1] if "--portfolio" in args else None
+    pf_filter = opt("--portfolio")
+    only = pf_filter[0] if pf_filter else None
 
     print(f"file:    {path}")
     print(f"columns: {len(header)}   blocks: {len(blocks)}   "
@@ -360,23 +503,7 @@ def main():
     links = cash_links(blocks)
     print(f"cash links: {len(links)} "
           f"({sum(1 for _, tgt in links if tgt is None)} unresolved)")
-
-    # Two things worth surfacing rather than letting the caller discover them
-    # the hard way. Both are documented in README §8.
-    if warnings:
-        print(f"\n⚠ {len(warnings)} numeric cell(s) present but unparseable — each "
-              f"was replaced by 0.0, so some position below may be wrong:")
-        for row_id, col, raw in warnings[:10]:
-            print(f"    Id {row_id} column {col!r}: {raw!r}")
-        if len(warnings) > 10:
-            print(f"    ... and {len(warnings) - 10} more")
-
-    dupes = [k for k, n in Counter((b.portfolio, b.symbol) for b in blocks).items() if n > 1]
-    if dupes:
-        print(f"\n⚠ {len(dupes)} (Portfolio, Symbol) pair(s) appear as more than one "
-              f"block. Anything that assumes one block per pair will lose a position:")
-        for pf, sym in dupes[:5]:
-            print(f"    {pf} / {sym}")
+    _report_problems(problems)
     print()
 
     for pf, bs in sorted(by_portfolio(blocks).items()):
@@ -388,6 +515,13 @@ def main():
             print(f"  {b.symbol:14s} {b.kind():9s} net={b.net_shares():>16,.4f} "
                   f"@{b.last_price:<12,.4f} mv={b.market_value():>16,.2f} "
                   f"{b.currency:4s} n={len(b.txns):<4d} {flows}")
+
+    # A file with problems still prints its positions — they are useful even when
+    # incomplete — but the exit code has to say so, or a script calling this will
+    # treat corrupted output as success.
+    if problems:
+        print(f"\nexiting non-zero: {problems.summary()}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

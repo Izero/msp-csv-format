@@ -22,7 +22,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Run self-test
+      - name: Unit tests
+        run: python -m unittest -v
+      - name: Self-test (no test runner needed)
         run: python msp_export_parser.py --self-test
       - name: Parse the example through the normal CLI path
         run: python msp_export_parser.py example-export.csv

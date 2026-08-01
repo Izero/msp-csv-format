@@ -23,3 +23,7 @@ Id,Symbol,Name,Display Symbol,Exchange,Portfolio,Currency,Last Traded Price,Shar
 "17","^GSPC","S&P 500",,"SNP","Main","USD","5200.00",,,,,,,,,,,,
 "18","^GSPC","S&P 500",,"SNP","Main","USD","5200.00","250","4800.00","0.00","2024-07-08 GMT+0800","21:35:00",,,"Buy",,,"5 contracts x USD 50 per point = 250. shares x price = notional.",
 "19","^GSPC","S&P 500",,"SNP","Main","USD","5200.00","-85.50","0","0.00","2024-12-19 GMT+0800","00:00:00",,,"Dividend",,,"roll cost booked as a negative dividend",
+,,,,,,,,,,,,,,,,,,,
+"20","CHFUSD=X","CHF/USD",,,"Margin","USD","1.1450",,,,,,,,,,,,
+"21","CHFUSD=X","CHF/USD",,,"Margin","USD","1.1450","50000","1.1300","0.00","2024-08-14 GMT+0800","09:05:00",,,"Sell Short",,,"borrowed CHF 50k",
+"22","CHFUSD=X","CHF/USD",,,"Margin","USD","1.1450","0","1.1210","0.00","2025-02-28 GMT+0800","15:40:00",,,"Buy to Cover All","FIFO",,"THE SAME TRAP on the short side: shares is 0, the whole 50k was repaid.",

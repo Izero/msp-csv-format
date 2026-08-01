@@ -5,7 +5,8 @@ Market** (MSP, by Peeksoft), plus a dependency-free reference parser.
 
 - iOS App Store ID `923544282` · Android package `co.peeksoft.stocks`
 - <https://mystocksportfolio.app> · <https://help.mystocksportfolio.app>
-- **Derived from exports produced by iOS version 2.522.0**
+- **Evidence base:** eleven weekly iOS exports. The CSV does not record the app
+  version, so only the most recent is tied to one (`2.522.0`) — see §1
 
 ## Why this exists
 
@@ -47,20 +48,25 @@ Every claim is tagged with how it is known:
 ## Quick start
 
 ```bash
+python3 -m unittest          # 23 tests
 python3 msp_export_parser.py --self-test
 ```
 
-That parses the bundled `example-export.csv` (a synthetic file covering every
-transaction type and every trap below) and checks the derived positions:
+Both run against `example-export.csv`, a synthetic file that exercises every
+transaction type and every trap documented below. The self-test needs no test
+runner, and fails if the example ever stops covering a type:
 
 ```
-parsed 5 blocks, 14 transactions, 20 columns
+parsed 6 blocks, 16 transactions, 20 columns
 
   ok   Main     ACME       net=      150.00
   ok   Main     GLOBEX.L   net=        0.00
   ok   Main     USD=CASH   net=   -4,956.00
   ok   Margin   EURUSD=X   net=  -70,250.00
   ok   Main     ^GSPC      net=      250.00
+  ok   Margin   CHFUSD=X   net=        0.00
+
+all expectations met
 ```
 
 Against your own export:
@@ -73,6 +79,14 @@ python3 msp_export_parser.py path/to/export.csv --raw Margin EURUSD=X
 
 Python 3.9+, standard library only. (3.9 is the oldest version CI actually runs;
 the code uses nothing newer, but nothing older has been tested either.)
+
+**On bad input the parser is loud, by design.** A file missing columns every
+export has raises `NotAnMspExport` and the CLI exits 2 — an earlier version
+parsed a three-column CSV into a set of empty positions and exited 0. Rows the
+parser cannot act on (an unparseable number, a transaction type it does not
+recognise) are collected into a `Problems` object, printed, and turned into a
+non-zero exit. Positions are still shown, because partial output is useful, but
+nothing pretends the result is complete.
 
 ## 1. File structure
 
@@ -97,10 +111,9 @@ Id,Symbol,Name,...,OutgoingCashLink       <- header (1 line)
 - `Id` is unique and monotonically increasing **within one file**; snapshot rows
   consume an Id too. It is **renumbered between exports** — see §7. [Verified]
 
-**Column count varies by app version.** Earlier exports in the sample had 19
-columns; later ones had 20, the new one being `Purchase Exchange Currencies`
-(empty throughout). **Resolve columns by header name. Never hardcode indices.**
-[Verified]
+**Column count varies by app version.** A 2026-05 export had 19 columns; a 2026-07
+export had 20, the new one being `Purchase Exchange Currencies` (empty throughout).
+**Resolve columns by header name. Never hardcode indices.** [Verified]
 
 ### Row order within a block
 
@@ -134,11 +147,11 @@ Everything here comes from the exports below. If yours falls outside this range 
 different platform, different app version, different column count — treat every
 claim as a starting hypothesis rather than a fact.
 
-| Columns | Share of the sample | App version | Platform |
+| Columns | Exports | App version | Platform |
 |---|---|---|---|
-| 19 | the earlier exports | unknown | iOS |
-| 20 | the later exports, including the most recent | `2.522.0` (most recent only) | iOS |
-| — | never examined | — | **Android (`co.peeksoft.stocks`)** |
+| 19 | 2026-05 through mid-2026-07 | unknown | iOS |
+| 20 | late 2026-07 onward, including the most recent | `2.522.0` (most recent only) | iOS |
+| — | none — never examined | — | **Android (`co.peeksoft.stocks`)** |
 
 **The app version is not recorded anywhere in the CSV**, so only the most recent
 export can be tied to a version with any certainty. The earlier ones were produced
@@ -202,6 +215,10 @@ official documentation.** Their semantics below are from data.
 | `Interest` | **none** | **cash amount** | [Verified] |
 | `Split` | **× shares ÷ cost** | numerator of the ratio | [Verified] |
 
+The middle column describes what *kind* of value the cell holds, not its sign.
+`Shares Owned` is signed on every type — see the next section before implementing
+any of these.
+
 ### Sign convention
 
 `Shares Owned` is a **signed** value, and its sign is independent of `Type`. The
@@ -213,11 +230,16 @@ In one real export, negative values appeared on five of the ten types — includ
 security.** [Verified] The typical case is a `Buy USD=CASH` row carrying a negative
 amount, used to record an outflow.
 
-For implementers this means: do not take the absolute value, and do not assume the
-column is unsigned. A `Sell` row carrying a negative value has to reduce the
-position by a negative amount — that is, increase it — because that is what the
-person entering it meant. Applying `−1` to `abs(value)` gets the direction right
-by accident on most rows and wrong on those.
+Two claims here with different strengths, and they are worth separating. **That
+negative values occur on those types is [Verified]** — counted directly off the
+data. **That the correct reading is "a negative value reverses the direction" is
+[Convention]** — it follows from how the person entering the data was using the
+app, and the sample contains exactly one person. The arithmetic is unambiguous
+either way; what is being inferred is the intent behind it.
+
+For implementers: do not take the absolute value, and do not assume the column is
+unsigned. Applying `−1` to `abs(value)` gets the direction right by accident on
+most rows and wrong on every row that carries a sign.
 
 Whether a negative value can appear on a real security is unknown. [Unconfirmed]
 
@@ -226,14 +248,14 @@ Whether a negative value can appear on a real security is unknown. [Unconfirmed]
 **This is the most expensive mistake available in this format.**
 
 `Sell All` and `Buy to Cover All` flatten the position unconditionally. The
-`Shares Owned` column on those rows cannot be used as a delta. Across every such
-row in one real export:
+`Shares Owned` column on those rows cannot be used as a delta. Across every row of
+these two types in one real export — a hundred-odd of them:
 
-| What `Shares Owned` contained | How often |
+| What `Shares Owned` contained | Share of those rows |
 |---|---|
-| `0` — no information at all | the overwhelming majority |
-| the exact pre-close balance | a handful |
-| the balance off by a rounding tail | one |
+| `0` — no information at all | ~95% |
+| the exact pre-close balance | ~4% |
+| the balance off by a rounding tail | a single row |
 
 The same column, on the same transaction type, is filled two incompatible ways.
 Only the "flatten" reading works for both.
@@ -337,7 +359,7 @@ symbol lacks `=F`, verify before trusting the product. [Unconfirmed]
 **`Id` is only valid inside a single file.** [Verified]
 
 Comparing two exports taken two days apart: of the transactions present in both,
-**15.5% had a different `Id`**.
+**15.5% had a different `Id`** — roughly one in six.
 
 Within a single block the Ids are usually stable — it is the file-level numbering
 that shifts, apparently because the export renumbers by internal ordering, so any
@@ -378,12 +400,20 @@ surfaced a row from six months earlier that had simply been renumbered.
    row, one of the two carrying no transactions at all. Anything that keys on the
    pair — a dict, a `GROUP BY` — silently drops one of them. Sum per *block*, not
    per pair. The bundled parser reports this case instead of merging it away.
+   [Verified]
 10. **A transaction row with an empty `Transaction Date` would be indistinguishable
     from a snapshot row.** The empty date is the only marker the format provides,
     and there is no second signal to fall back on. Such a row would be read as a
     snapshot and disappear from the position entirely. Never observed, but nothing
     in the format prevents it. [Unconfirmed]
-11. **Number formatting is assumed to be `.` decimal separator, `,` thousands
+11. **Quantities are parsed as binary `float`.** Fine for share counts and the
+    arithmetic here (addition and one ratio multiply), but `float` cannot
+    represent most decimal fractions exactly, so a long chain of accumulations
+    can drift in the last places. If you extend this into money — cost basis,
+    realised P&L, tax lots — switch to `decimal.Decimal`, which is what the app's
+    own string representation implies anyway. The reference parser keeps `float`
+    to stay readable in one sitting. [Verified]
+12. **Number formatting is assumed to be `.` decimal separator, `,` thousands
     separator.** This has not been checked on a device whose locale reverses the
     two. If yours does, both the reference parser and several numeric claims in §2
     need re-verification. To check: switch the device locale, re-export, and diff
@@ -413,9 +443,12 @@ to have caught several non-obvious traps, and not good enough to be called
 authoritative. Some readings could be wrong. Some are marked `[Unconfirmed]`
 precisely because they are still guesses.
 
-Scope of the evidence: exports from **iOS version 2.522.0**, one portfolio, eleven
-weekly files. Other app versions may behave differently, and the format may change
-at any time without notice.
+Scope of the evidence: eleven weekly iOS exports from a single portfolio. The CSV
+records no app version, so only the most recent export can be tied to one
+(**2.522.0**); the earlier ones were produced by whatever version was current at
+the time, which is not recoverable from the files. Other versions may behave
+differently, **Android was never examined at all**, and the format may change
+without notice.
 
 ### Not affiliated
 
