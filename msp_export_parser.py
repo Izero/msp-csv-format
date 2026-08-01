@@ -261,6 +261,15 @@ class Block:
         return dict(out)
 
     def total_commission(self):
+        """Sum of the Commission column across this block's transactions.
+
+        ⚠ **Non-numeric cells read as 0, so this can under-report silently.**
+        Real exports contain percentage strings in Commission (README §8), and
+        the parser grades those as a *notice* rather than an error because no
+        position depends on the column — which means a caller using this
+        accessor never sees the warning a CLI user does. Check
+        `problems.unparseable_incidental` before trusting the total.
+        """
         return sum(t.commission for t in self.txns)
 
     def market_value(self):
@@ -296,10 +305,25 @@ class Block:
 class Problems:
     """Everything the parser noticed but could not fix.
 
-    Split in two. **Errors** mean a number may be wrong; `bool(problems)` reads
-    only these, and the CLI exits non-zero on them. **Notices** are things worth
-    knowing that change no number: documented format behaviour, or a deviation
-    from what §1 records with no consequence for the arithmetic.
+    Split in two. **Errors** mean a position or a market value may be wrong;
+    `bool(problems)` reads only these, and the CLI exits non-zero on them.
+    **Notices** leave positions and market values intact — documented format
+    behaviour, or a deviation from what the specification records.
+
+    ⚠ **"Leaves positions intact" is not "changes nothing".** A non-numeric
+    `Commission` is a notice because no position depends on that column, but it
+    still reads as 0, so `Block.total_commission()` under-reports. That
+    accessor's docstring says so; this grading cannot, because a caller may
+    never reach it. If you use a number outside position and market value,
+    check `unparseable_incidental` yourself.
+
+    **The grading is by column, not by each row's actual consequence.** A bad
+    `Cost Per Share` on a `Buy` affects nothing (only `Split` reads it), and a
+    bad `Shares Owned` on a `Sell All` is discarded by the flatten rule — both
+    are errors anyway. Refining that would mean a table of which column matters
+    for which type, kept in step with `net_shares()` by hand; a drifting copy of
+    that logic is a worse failure than a conservative error. Measured against
+    real exports, the conservative version produces no false alarms.
 
     The point of collecting any of it is that every failure mode here is
     otherwise completely silent — the file parses, the exit code is 0, and the
@@ -314,6 +338,7 @@ class Problems:
     blank_ids: list = field(default_factory=list)      # line numbers
     orphan_blocks: list = field(default_factory=list)  # (portfolio, symbol)
     incomplete_snapshots: list = field(default_factory=list)  # (line, [fields])
+    unpriced_positions: list = field(default_factory=list)  # (portfolio, symbol, net)
     unresolved_links: list = field(default_factory=list)  # (source_id, target_id)
 
     # --- notices: documented behaviour, or deviations that change nothing ---
@@ -336,7 +361,7 @@ class Problems:
                     or self.unapplicable_splits or self.malformed_rows
                     or self.duplicate_ids or self.blank_ids
                     or self.orphan_blocks or self.unresolved_links
-                    or self.incomplete_snapshots)
+                    or self.incomplete_snapshots or self.unpriced_positions)
 
     def summary(self):
         bits = []
@@ -355,6 +380,8 @@ class Problems:
         if self.incomplete_snapshots:
             bits.append(f"{len(self.incomplete_snapshots)} snapshot row(s) missing "
                         f"an identifying field")
+        if self.unpriced_positions:
+            bits.append(f"{len(self.unpriced_positions)} position(s) with no price")
         if self.unresolved_links:
             bits.append(f"{len(self.unresolved_links)} unresolved cash link(s)")
         if self.malformed_rows:
@@ -503,6 +530,15 @@ def parse(path):
                                   for k in range(1, len(numeric))
                                   if numeric[k][1] <= numeric[k - 1][1]]
 
+    # A snapshot row with a blank price has exactly the consequence orphan_blocks
+    # exists to report — market value 0 on a position that is not zero, which
+    # reads like an answer. `has_snapshot` filters out the orphans, which have
+    # their own bucket. This is likelier than a missing snapshot in practice:
+    # delisted tickers and symbols the quote source dropped both go blank.
+    problems.unpriced_positions = [
+        (b.portfolio, b.symbol, b.net_shares()) for b in blocks
+        if b.has_snapshot and b.last_price == 0 and b.net_shares() != 0]
+
     for b in blocks:
         for row_id in b.unapplicable_splits():
             problems.unapplicable_splits.append((row_id, b.portfolio, b.symbol))
@@ -604,6 +640,13 @@ def _report_problems(problems, prefix="⚠"):
               f"every market value in them is 0 — which reads like a real answer:")
         for pf, sym in problems.orphan_blocks[:10]:
             print(f"    {pf} / {sym}")
+    if problems.unpriced_positions:
+        n += len(problems.unpriced_positions)
+        print(f"\n{prefix} {len(problems.unpriced_positions)} block(s) hold a "
+              f"non-zero position at a price of 0 — the snapshot row's "
+              f"'Last Traded Price' was blank, so their market value reads 0:")
+        for pf, sym, net in problems.unpriced_positions[:10]:
+            print(f"    {pf} / {sym}: net {net:,.4f} @ 0")
     if problems.blank_ids:
         n += len(problems.blank_ids)
         print(f"\n{prefix} {len(problems.blank_ids)} row(s) have a blank Id. §1 "

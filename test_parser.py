@@ -390,6 +390,57 @@ class TestFailsLoudly(unittest.TestCase):
         finally:
             os.unlink(incidental)
 
+    def test_position_with_no_price_is_an_error(self):
+        """Same consequence as a missing snapshot — market value 0 on a position
+        that is not zero — so it gets the same treatment. Likelier in practice
+        too: a delisted ticker leaves the price blank."""
+        path = _csv(_row(Id="1", Symbol="ACME", Portfolio="Main", Currency="USD"),
+                    _txn("Main", "ACME", "Buy", 100, rid="2"))
+        try:
+            blocks, _, problems = P.parse(path)
+            self.assertEqual(problems.unpriced_positions, [("Main", "ACME", 100.0)])
+            self.assertEqual(blocks[0].market_value(), 0.0)
+            self.assertTrue(problems)
+        finally:
+            os.unlink(path)
+
+    def test_no_price_with_no_position_is_not_reported(self):
+        """A flat block at price 0 says nothing wrong — nothing to value."""
+        path = _csv(_row(Id="1", Symbol="ACME", Portfolio="Main", Currency="USD"))
+        try:
+            _, _, problems = P.parse(path)
+            self.assertEqual(problems.unpriced_positions, [])
+            self.assertFalse(problems)
+        finally:
+            os.unlink(path)
+
+    def test_orphan_block_is_not_double_counted_as_unpriced(self):
+        path = _csv(_txn("Main", "ACME", "Buy", 100, rid="2"))
+        try:
+            _, _, problems = P.parse(path)
+            self.assertEqual(problems.orphan_blocks, [("Main", "ACME")])
+            self.assertEqual(problems.unpriced_positions, [])
+        finally:
+            os.unlink(path)
+
+    def test_total_commission_under_reports_on_non_numeric_cells(self):
+        """Pinning the documented behaviour, not endorsing it: the accessor
+        cannot warn, so its docstring points at problems.unparseable_incidental."""
+        path = _csv(_snapshot("Main", "ACME"),
+                    _row(Id="2", Symbol="ACME", Portfolio="Main", Type="Buy",
+                         Currency="USD",
+                         **{"Shares Owned": "100", "Cost Per Share": "1",
+                            "Commission": "5%", "Last Traded Price": "10",
+                            "Transaction Date": "2024-01-01 GMT+0800"}))
+        try:
+            blocks, _, problems = P.parse(path)
+            self.assertEqual(blocks[0].total_commission(), 0.0)
+            self.assertEqual(len(problems.unparseable_incidental), 1)
+            self.assertIn("unparseable_incidental",
+                          P.Block.total_commission.__doc__)
+        finally:
+            os.unlink(path)
+
     def test_snapshot_without_identity_is_an_error(self):
         """A snapshot with no Symbol or Portfolio still opens a block, and its
         contents print as "[]  1 symbols"."""
@@ -648,6 +699,13 @@ class TestCommandLineExitCodes(unittest.TestCase):
         r = self._run(path)
         self.assertEqual(r.returncode, 0)
         self.assertIn("note:", r.stdout)
+
+    def test_unpriced_position_exits_one(self):
+        path = self._tmp(_row(Id="1", Symbol="ACME", Portfolio="Main", Currency="USD"),
+                         _txn("Main", "ACME", "Buy", 100, rid="2"))
+        r = self._run(path)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("price of 0", r.stdout)
 
     def test_snapshot_without_identity_exits_one(self):
         path = self._tmp(_row(Id="1", Symbol="", Portfolio="", Currency="USD",

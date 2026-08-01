@@ -48,7 +48,7 @@ Every claim is tagged with how it is known:
 ## Quick start
 
 ```bash
-python3 -m unittest          # 62 tests
+python3 -m unittest          # 67 tests
 python3 msp_export_parser.py --self-test
 ```
 
@@ -118,6 +118,21 @@ exists because of §8's `Commission` finding: real exports contain percentage
 strings there, no position depends on the column, and grading it as an error
 would mean a healthy export never exits 0 — which teaches people to ignore the
 exit code.
+
+**A notice means positions and market values are intact, not that nothing
+changed.** That same non-numeric `Commission` still reads as 0, so
+`Block.total_commission()` under-reports it. The exit code cannot express
+"correct in the way you probably care about, wrong in a way you might"; the
+accessor's docstring carries that warning instead, and `Problems` keeps the
+offending cells in `unparseable_incidental` for anyone computing something
+other than a position.
+
+The grading is by column rather than by each row's actual consequence — a bad
+`Cost Per Share` on a `Buy` affects nothing, since only `Split` reads it, and a
+bad `Shares Owned` on a `Sell All` is discarded by the flatten rule. Both are
+errors anyway. Refining it would mean maintaining a table of which column
+matters for which type, in step with the position logic by hand, and a drifting
+copy of that logic is a worse failure than a conservative error.
 
 The parser also checks the structural claims this document makes about the file
 rather than assuming them: unique non-blank `Id`s (§1, which cash-link
@@ -480,7 +495,14 @@ surfaced a row from six months earlier that had simply been renumbered.
     file happens to contain a counter-example. If you are on such a locale, verify
     before trusting any number here. To settle it: switch the device locale,
     re-export, and diff against a known file.
-13. **`Commission` is not always a number.** In one real export a handful of
+13. **`Last Traded Price` can be blank on a snapshot row.** Not observed in the
+    sample, but a delisted ticker or one the quote source stopped covering has
+    nowhere else to go. [Unconfirmed] A blank price parses to 0, which makes
+    every market value in that block 0 while the position itself is untouched —
+    the same shape of wrong answer as a block with no snapshot row at all, and
+    likelier to happen. Nothing in the file marks it. The reference parser
+    reports any block holding a non-zero position at a price of 0.
+14. **`Commission` is not always a number.** In one real export a handful of
     `Commission` cells held a percentage string (`5%`, `0.5%`) rather than an
     amount — presumably a rate recorded where a fee was expected. The app accepts
     it; anything parsing the column has to decide what to do with it. The
