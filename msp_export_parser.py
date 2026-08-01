@@ -186,6 +186,10 @@ class Block:
     currency: str
     last_price: float
     txns: list = field(default_factory=list)
+    # False when transactions appeared with no snapshot row above them. Such a
+    # block has no price, so every market value in it is 0 — worth knowing
+    # before you sum them.
+    has_snapshot: bool = True
 
     def net_shares(self):
         """Derive the net position by replaying transactions in file order.
@@ -214,9 +218,9 @@ class Block:
         return qty
 
     def unapplicable_splits(self):
-        """`Split` rows whose ratio cannot be applied — blank or zero denominator.
+        """`Split` rows whose ratio cannot be applied.
 
-`shares:cost = new:old`. **Both sides have to be positive.** Zero or blank
+        `shares:cost = new:old`. **Both sides have to be positive.** Zero or blank
         makes the ratio undefined; a negative on either side makes it *inverted*,
         which is worse — a truthiness guard lets `-1` through and turns a 100
         share long into a 200 share short, exit 0, no output. That is the same
@@ -289,13 +293,19 @@ class Problems:
     otherwise completely silent — the file parses, exit code is 0, and the
     numbers are simply incorrect.
     """
+    # --- errors: something is wrong and the numbers may be affected ---
     unparseable: list = field(default_factory=list)   # (row_id, column, raw_value)
     unknown_types: dict = field(default_factory=dict)  # type name -> row count
     unapplicable_splits: list = field(default_factory=list)  # (row_id, portfolio, symbol)
-    duplicate_ids: list = field(default_factory=list)   # (id, occurrences)
-    unresolved_links: list = field(default_factory=list)  # (source_id, target_id)
     malformed_rows: list = field(default_factory=list)  # (line_number, cell_count)
+    duplicate_ids: list = field(default_factory=list)   # (id, occurrences)
+    blank_ids: list = field(default_factory=list)      # line numbers
+    orphan_blocks: list = field(default_factory=list)  # (portfolio, symbol)
+    unresolved_links: list = field(default_factory=list)  # (source_id, target_id)
+
+    # --- notices: documented behaviour, or deviations that change nothing ---
     duplicate_pairs: list = field(default_factory=list)  # (portfolio, symbol)
+    non_monotonic_ids: list = field(default_factory=list)  # (previous, current)
 
     def __bool__(self):
         """True when something is actually *wrong*.
@@ -307,8 +317,9 @@ class Problems:
         file containing one is not a bad file.
         """
         return bool(self.unparseable or self.unknown_types
-                    or self.unapplicable_splits or self.duplicate_ids
-                    or self.malformed_rows or self.unresolved_links)
+                    or self.unapplicable_splits or self.malformed_rows
+                    or self.duplicate_ids or self.blank_ids
+                    or self.orphan_blocks or self.unresolved_links)
 
     def summary(self):
         bits = []
@@ -320,6 +331,10 @@ class Problems:
             bits.append(f"{len(self.unapplicable_splits)} split(s) with an undefined ratio")
         if self.duplicate_ids:
             bits.append(f"{len(self.duplicate_ids)} duplicated Id(s)")
+        if self.blank_ids:
+            bits.append(f"{len(self.blank_ids)} row(s) with a blank Id")
+        if self.orphan_blocks:
+            bits.append(f"{len(self.orphan_blocks)} block(s) with no snapshot row")
         if self.unresolved_links:
             bits.append(f"{len(self.unresolved_links)} unresolved cash link(s)")
         if self.malformed_rows:
@@ -357,6 +372,16 @@ def parse(path):
             f"MSP writes UTF-8; another encoding means this is either not an "
             f"export or was re-saved by something else.") from None
 
+    repeated = sorted({n for n, c in Counter(header).items() if c > 1})
+    if repeated:
+        # A dict keyed on column name keeps the last of any duplicate, so a second
+        # (blank) "Transaction Date" made every transaction row look like a
+        # snapshot: 22 blocks, 0 transactions, exit 0.
+        raise NotAnMspExport(
+            f"{path} has repeated column name(s): {', '.join(repeated)}. "
+            f"Column lookup is by name, so a duplicate silently shadows the "
+            f"first occurrence.")
+
     missing = [c for c in REQUIRED_COLUMNS if c not in header]
     if missing:
         raise NotAnMspExport(
@@ -390,7 +415,7 @@ def parse(path):
             # snapshot and it becomes a ghost block with an empty portfolio name.
             problems.malformed_rows.append((line_no, len(row)))
             continue
-        all_ids.append(get(row, "Id"))
+        all_ids.append((line_no, get(row, "Id")))
         if not get(row, "Transaction Date"):
             current = Block(
                 portfolio=get(row, "Portfolio"),
@@ -422,17 +447,29 @@ def parse(path):
         # A transaction with no preceding snapshot row should not happen, but
         # fail loudly rather than silently attaching it to the wrong block.
         if current is None or (current.portfolio, current.symbol) != (txn.portfolio, txn.symbol):
+            # Transactions with no snapshot row above them. The block has no
+            # price, so its market value is 0 — which looks like a real answer.
+            # The comment here used to claim this failed loudly; it did not.
             current = Block(portfolio=txn.portfolio, symbol=txn.symbol,
-                            name="<NO SNAPSHOT ROW>", exchange="",
-                            currency=txn.currency, last_price=0.0)
+                            name="", exchange="", currency=txn.currency,
+                            last_price=0.0, has_snapshot=False)
             blocks.append(current)
+            problems.orphan_blocks.append((txn.portfolio, txn.symbol))
         current.txns.append(txn)
 
     # §1 states Id uniqueness within a file as [Verified]. cash_links() trusts it
     # — a dict keyed on Id silently keeps the last of any duplicates — so a file
     # that breaks the claim is not the thing the specification describes.
-    problems.duplicate_ids = [(i, n) for i, n in Counter(all_ids).items()
+    problems.duplicate_ids = [(i, n) for i, n in Counter(i for _, i in all_ids).items()
                               if n > 1 and i]
+    problems.blank_ids = [line for line, i in all_ids if not i]
+    # §1 also claims Ids increase monotonically. Nothing here depends on that, so
+    # a violation is reported as a notice: it means the file is not quite what the
+    # specification describes, without making any number wrong.
+    numeric = [(line, int(i)) for line, i in all_ids if i.isdigit()]
+    problems.non_monotonic_ids = [(numeric[k - 1][1], numeric[k][1])
+                                  for k in range(1, len(numeric))
+                                  if numeric[k][1] <= numeric[k - 1][1]]
 
     for b in blocks:
         for row_id in b.unapplicable_splits():
@@ -463,6 +500,12 @@ def cash_links(blocks):
 
     Returns [(source_txn, target_txn_or_None)]. The link is an Id, and Ids are
     only valid WITHIN ONE FILE — they get renumbered between exports.
+
+    ⚠ **Snapshot rows consume an Id (§1) but are not transactions, so they are
+    not resolution targets here.** A link pointing at a snapshot row's Id would
+    therefore come back unresolved. Across eleven real exports — 1798 links —
+    that never happened, and neither did a link pointing at an Id absent from
+    the file. Both remain observations rather than guarantees.
     """
     by_id = {t.id: t for b in blocks for t in b.txns}
     return [(t, by_id.get(t.cash_link))
@@ -494,9 +537,10 @@ def _report_problems(problems, prefix="⚠"):
             print(f"    ... and {len(problems.unparseable) - 10} more")
     if problems.unapplicable_splits:
         n += len(problems.unapplicable_splits)
-        print(f"\n{prefix} {len(problems.unapplicable_splits)} Split row(s) with an "
-              f"undefined ratio (blank or zero 'Cost Per Share'). The split was NOT "
-              f"applied, so the position is stuck at its pre-split value:")
+        print(f"\n{prefix} {len(problems.unapplicable_splits)} Split row(s) whose "
+              f"ratio cannot be applied — 'Shares Owned' and 'Cost Per Share' must "
+              f"BOTH be positive (blank, zero or negative on either side). The split "
+              f"was NOT applied, so the position is stuck at its pre-split value:")
         for row_id, pf, sym in problems.unapplicable_splits[:10]:
             print(f"    Id {row_id}: {pf} / {sym}")
     if problems.malformed_rows:
@@ -509,10 +553,24 @@ def _report_problems(problems, prefix="⚠"):
     if problems.unresolved_links:
         n += len(problems.unresolved_links)
         print(f"\n{prefix} {len(problems.unresolved_links)} OutgoingCashLink value(s) "
-              f"point at an Id that is not in this file. Positions are unaffected, "
-              f"but the cash pairing is incomplete (§5):")
+              f"did not resolve to a transaction in this file — the Id is either "
+              f"absent, or belongs to a snapshot row, which is not a transaction. "
+              f"Positions are unaffected; the cash pairing is not (§5):")
         for src_id, target in problems.unresolved_links[:10]:
             print(f"    Id {src_id} → {target!r} (not found)")
+    if problems.orphan_blocks:
+        n += len(problems.orphan_blocks)
+        print(f"\n{prefix} {len(problems.orphan_blocks)} block(s) have transactions "
+              f"but no snapshot row above them. Those blocks carry no price, so "
+              f"every market value in them is 0 — which reads like a real answer:")
+        for pf, sym in problems.orphan_blocks[:10]:
+            print(f"    {pf} / {sym}")
+    if problems.blank_ids:
+        n += len(problems.blank_ids)
+        print(f"\n{prefix} {len(problems.blank_ids)} row(s) have a blank Id. §1 "
+              f"states every row consumes a unique Id, and cash-link resolution "
+              f"needs it:")
+        print(f"    line(s) {', '.join(str(x) for x in problems.blank_ids[:15])}")
     if problems.duplicate_ids:
         n += len(problems.duplicate_ids)
         print(f"\n{prefix} {len(problems.duplicate_ids)} duplicated Id(s). §1 states "
@@ -528,9 +586,13 @@ def _report_problems(problems, prefix="⚠"):
         for ttype, count in sorted(problems.unknown_types.items()):
             print(f"    {ttype!r}: {count} row(s)")
         print("    If the app added a type, this parser is out of date.")
-    # Not counted as an error: this is documented format behaviour and the parser
-    # handles it correctly by keeping both blocks. Reported so that a caller who
-    # keys on the pair is not caught out.
+    # Notices below: nothing here makes a number wrong.
+    if problems.non_monotonic_ids:
+        first_prev, first_cur = problems.non_monotonic_ids[0]
+        print(f"\nnote: Id is not monotonically increasing "
+              f"({len(problems.non_monotonic_ids)} place(s), first at "
+              f"{first_prev} → {first_cur}). §1 records it as increasing; nothing "
+              f"in this parser depends on that, so this is informational.")
     if problems.duplicate_pairs:
         print(f"\nnote: {len(problems.duplicate_pairs)} (Portfolio, Symbol) pair(s) "
               f"occupy more than one block — normal for this format (README §8), "

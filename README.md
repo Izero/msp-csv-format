@@ -48,7 +48,7 @@ Every claim is tagged with how it is known:
 ## Quick start
 
 ```bash
-python3 -m unittest          # 49 tests
+python3 -m unittest          # 56 tests
 python3 msp_export_parser.py --self-test
 ```
 
@@ -101,9 +101,17 @@ recognise — go into a `Problems` object, get printed, and force exit 1.
 Positions are still shown, because partial output is useful; nothing pretends
 the result is complete.
 
-One case is reported but *not* an error: a `(Portfolio, Symbol)` pair occupying
-two blocks (§8). That is documented format behaviour, handled correctly by
-keeping both blocks, so it prints a `note:` and exits 0.
+The parser also checks the structural claims this document makes about the file
+rather than assuming them: unique non-blank `Id`s (§1, which cash-link
+resolution depends on), no repeated column names (lookup is by name, so a
+duplicate shadows the first silently), every block having its snapshot row (a
+block without one carries no price, so its market values are all 0), and every
+`OutgoingCashLink` resolving inside the file (§5).
+
+Two things are reported as `note:` and exit 0, because they are documented
+behaviour or change nothing: a `(Portfolio, Symbol)` pair occupying two blocks
+(§8), and `Id`s that are not monotonically increasing — §1 records them as
+increasing, but nothing here depends on it.
 
 ## 1. File structure
 

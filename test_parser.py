@@ -417,6 +417,55 @@ class TestStructuralIntegrity(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_transactions_without_a_snapshot_are_reported(self):
+        """The comment on this branch used to say it failed loudly. It did not:
+        the block got no price, so every market value in it was 0 — which reads
+        like a real answer — and the file exited 0."""
+        path = _csv(_txn("Main", "ACME", "Buy", 100, rid="2"))
+        try:
+            blocks, _, problems = P.parse(path)
+            self.assertEqual(problems.orphan_blocks, [("Main", "ACME")])
+            self.assertFalse(blocks[0].has_snapshot)
+            self.assertEqual(blocks[0].market_value(), 0.0)
+            self.assertTrue(problems)
+        finally:
+            os.unlink(path)
+
+    def test_repeated_column_name_raises(self):
+        """Lookup is by name, so a duplicate shadows the first occurrence. A
+        second blank 'Transaction Date' made every transaction look like a
+        snapshot: 22 blocks, 0 transactions, exit 0."""
+        path = _csv(header=",".join(list(P.COLUMNS_REFERENCE) + ["Transaction Date"]))
+        try:
+            with self.assertRaises(P.NotAnMspExport) as cm:
+                P.parse(path)
+            self.assertIn("repeated column name", str(cm.exception))
+        finally:
+            os.unlink(path)
+
+    def test_blank_id_is_reported(self):
+        path = _csv(_snapshot("Main", "ACME"),
+                    _txn("Main", "ACME", "Buy", 10, rid=""))
+        try:
+            _, _, problems = P.parse(path)
+            self.assertEqual(len(problems.blank_ids), 1)
+            self.assertTrue(problems)
+        finally:
+            os.unlink(path)
+
+    def test_non_monotonic_id_is_a_notice_not_an_error(self):
+        """§1 records Ids as increasing, but nothing here depends on it, so a
+        violation says the file differs from the spec without making a number
+        wrong."""
+        path = _csv(_snapshot("Main", "ACME", rid="9"),
+                    _txn("Main", "ACME", "Buy", 10, rid="3"))
+        try:
+            _, _, problems = P.parse(path)
+            self.assertEqual(problems.non_monotonic_ids, [(9, 3)])
+            self.assertFalse(problems, "a notice must not make the file bad")
+        finally:
+            os.unlink(path)
+
     def test_non_utf8_file_raises(self):
         fd, path = tempfile.mkstemp(suffix=".csv")
         with os.fdopen(fd, "wb") as f:
@@ -498,6 +547,23 @@ class TestCommandLineExitCodes(unittest.TestCase):
         r = self._run(path)
         self.assertEqual(r.returncode, 1)
         self.assertIn("undefined ratio", r.stdout)
+
+    def test_orphan_block_exits_one(self):
+        path = self._tmp(_txn("Main", "ACME", "Buy", 100, rid="2"))
+        r = self._run(path)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no snapshot row", r.stdout)
+
+    def test_repeated_header_exits_two(self):
+        path = self._tmp(header=",".join(list(P.COLUMNS_REFERENCE) + ["Type"]))
+        self.assertEqual(self._run(path).returncode, 2)
+
+    def test_non_monotonic_id_exits_zero(self):
+        path = self._tmp(_snapshot("Main", "ACME", rid="9"),
+                         _txn("Main", "ACME", "Buy", 10, rid="3"))
+        r = self._run(path)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("not monotonically increasing", r.stdout)
 
     def test_directory_argument_exits_two(self):
         """The exit-code table promises 2 for unreadable input; a directory
