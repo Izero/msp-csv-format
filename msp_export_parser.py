@@ -40,6 +40,7 @@ limitations under the License.
 import argparse
 import csv
 import math
+import re
 import os
 import sys
 from collections import Counter, defaultdict
@@ -71,9 +72,9 @@ QTY_SIGN = {
 
 # Types that flatten the position to zero.
 # *** The "Shares Owned" column is NOT usable for these. *** Across the rows of
-# this type in one real-world export: the overwhelming majority held 0, a handful
-# held the pre-close balance, one was off by a rounding tail. Treating the column
-# as a delta produces phantom positions that never raise an error.
+# these types in one real-world export (a hundred-odd of them): ~95% held 0, ~4%
+# held the pre-close balance, a single row was off by a rounding tail. Treating
+# the column as a delta produces phantom positions that never raise an error.
 # See README "The Sell All trap".
 FLATTEN_TYPES = {"Sell All", "Buy to Cover All"}
 
@@ -110,6 +111,12 @@ class NotAnMspExport(ValueError):
     """The file is missing columns an MSP export always has."""
 
 
+# A comma is only a thousands separator when it is followed by exactly three
+# digits. "1,5" is one-and-a-half in a comma-decimal locale and would otherwise
+# be read here as fifteen — a tenfold error, silently.
+_THOUSANDS = re.compile(r"^[+-]?\d{1,3}(,\d{3})*(\.\d+)?$")
+
+
 def _num(s, on_error=None):
     """Parse a numeric cell.
 
@@ -118,13 +125,20 @@ def _num(s, on_error=None):
     mode this specification spends its length warning about, so the two are kept
     apart: `on_error` is called with the raw value when a non-empty cell fails.
 
-    ⚠ Number format is assumed to be "." decimal separator, "," thousands
-    separator (discardable). This has not been checked on a device whose locale
-    reverses the two. See README §8. [Unconfirmed]
+    Assumes "." decimal separator and "," thousands separator. A comma in any
+    other position is rejected rather than stripped, so an export written under
+    a comma-decimal locale reports instead of returning a number ten or a
+    hundred times too large. See README §8.
     """
-    s = (s or "").strip().replace(",", "")
+    s = (s or "").strip()
     if not s:
         return 0.0
+    if "," in s:
+        if not _THOUSANDS.match(s):
+            if on_error is not None:
+                on_error(s)
+            return 0.0
+        s = s.replace(",", "")
     try:
         value = float(s)
     except ValueError:
@@ -187,6 +201,9 @@ class Block:
             elif t.ttype in SPLIT_TYPES:
                 if t.cost:
                     qty = qty * t.shares / t.cost
+                # else: undefined ratio. Left alone here and reported by
+                # `unapplicable_splits()` — see that method for why skipping
+                # quietly is the worst of the available options.
             elif t.ttype in CASH_ONLY_TYPES:
                 pass                            # amounts, not quantities
             # else: an unrecognised type. Deliberately does NOT fall through
@@ -194,6 +211,17 @@ class Block:
             # because a future app version adding a type would otherwise corrupt
             # positions with no signal at all.
         return qty
+
+    def unapplicable_splits(self):
+        """`Split` rows whose ratio cannot be applied — blank or zero denominator.
+
+        `shares:cost = new:old`, so a `Cost Per Share` of 0 (which is also what a
+        blank cell parses to) makes the ratio undefined. Guarding against the
+        division by skipping the row leaves the position at its pre-split value:
+        a plausible number, no error, no way to tell. `Split` is one of only two
+        order-sensitive types in the format, which makes silence here expensive.
+        """
+        return [t.id for t in self.txns if t.ttype in SPLIT_TYPES and not t.cost]
 
     def unknown_types(self):
         """Transaction types in this block that the parser cannot act on.
@@ -255,6 +283,7 @@ class Problems:
     """
     unparseable: list = field(default_factory=list)   # (row_id, column, raw_value)
     unknown_types: dict = field(default_factory=dict)  # type name -> row count
+    unapplicable_splits: list = field(default_factory=list)  # (row_id, portfolio, symbol)
     duplicate_pairs: list = field(default_factory=list)  # (portfolio, symbol)
 
     def __bool__(self):
@@ -266,7 +295,8 @@ class Problems:
         reported so that callers who key on the pair are not caught out, but a
         file containing one is not a bad file.
         """
-        return bool(self.unparseable or self.unknown_types)
+        return bool(self.unparseable or self.unknown_types
+                    or self.unapplicable_splits)
 
     def summary(self):
         bits = []
@@ -274,6 +304,8 @@ class Problems:
             bits.append(f"{len(self.unparseable)} unparseable numeric cell(s)")
         if self.unknown_types:
             bits.append(f"{len(self.unknown_types)} unrecognised transaction type(s)")
+        if self.unapplicable_splits:
+            bits.append(f"{len(self.unapplicable_splits)} split(s) with an undefined ratio")
         return "; ".join(bits) or "none"
 
 
@@ -363,6 +395,8 @@ def parse(path):
         current.txns.append(txn)
 
     for b in blocks:
+        for row_id in b.unapplicable_splits():
+            problems.unapplicable_splits.append((row_id, b.portfolio, b.symbol))
         for ttype in b.unknown_types():
             problems.unknown_types[ttype] = problems.unknown_types.get(ttype, 0) + sum(
                 1 for t in b.txns if t.ttype == ttype)
@@ -413,6 +447,13 @@ def _report_problems(problems, prefix="⚠"):
             print(f"    Id {row_id} column {col!r}: {raw!r}")
         if len(problems.unparseable) > 10:
             print(f"    ... and {len(problems.unparseable) - 10} more")
+    if problems.unapplicable_splits:
+        n += len(problems.unapplicable_splits)
+        print(f"\n{prefix} {len(problems.unapplicable_splits)} Split row(s) with an "
+              f"undefined ratio (blank or zero 'Cost Per Share'). The split was NOT "
+              f"applied, so the position is stuck at its pre-split value:")
+        for row_id, pf, sym in problems.unapplicable_splits[:10]:
+            print(f"    Id {row_id}: {pf} / {sym}")
     if problems.unknown_types:
         n += len(problems.unknown_types)
         print(f"\n{prefix} {len(problems.unknown_types)} unrecognised transaction "

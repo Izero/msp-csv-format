@@ -48,7 +48,7 @@ Every claim is tagged with how it is known:
 ## Quick start
 
 ```bash
-python3 -m unittest          # 37 tests
+python3 -m unittest          # 42 tests
 python3 msp_export_parser.py --self-test
 ```
 
@@ -231,6 +231,14 @@ official documentation.** Their semantics below are from data.
 | `Dividend` | **none** | **cash amount** | [Verified] |
 | `Interest` | **none** | **cash amount** | [Verified] |
 | `Split` | **× shares ÷ cost** | numerator of the ratio | [Verified] |
+
+`Split` carries the ratio as `shares:cost = new:old` — `shares=2, cost=1` is a
+2-for-1. **A zero or blank `Cost Per Share` makes that ratio undefined**, and
+there is no safe default: skipping the row leaves the position at its pre-split
+value, which is a plausible number carrying no indication that anything was
+dropped. The reference parser reports it rather than guessing. Along with the
+flattening types, `Split` is one of only two types where row order changes the
+answer (§1), so a quietly skipped one is expensive.
 
 The middle column describes what *kind* of value the cell holds, not its sign.
 `Shares Owned` is signed on every type — see the next section before implementing
@@ -431,10 +439,14 @@ surfaced a row from six months earlier that had simply been renumbered.
     own string representation implies anyway. The reference parser keeps `float`
     to stay readable in one sitting. [Verified]
 12. **Number formatting is assumed to be `.` decimal separator, `,` thousands
-    separator.** This has not been checked on a device whose locale reverses the
-    two. If yours does, both the reference parser and several numeric claims in §2
-    need re-verification. To check: switch the device locale, re-export, and diff
-    against a known file. [Unconfirmed]
+    separator.** Whether an export made under a comma-decimal locale differs has
+    not been checked — no such device was available. [Unconfirmed] The reference
+    parser no longer *assumes* silently: a comma is accepted only where a
+    thousands separator can go (followed by exactly three digits), so `1,234`
+    parses and `1,5` is reported instead of becoming `15`. That converts an
+    undetectable tenfold error into a visible one, but it does not tell you what
+    the value should have been. To settle the question: switch the device locale,
+    re-export, and diff against a known file.
 
 ## Official references
 

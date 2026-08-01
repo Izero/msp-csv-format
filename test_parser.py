@@ -294,6 +294,56 @@ class TestFailsLoudly(unittest.TestCase):
                 finally:
                     os.unlink(path)
 
+    def test_split_with_undefined_ratio_is_reported(self):
+        """The last silent path in the parser. `shares:cost = new:old`, so a zero
+        or blank denominator makes the ratio undefined; guarding the division by
+        skipping the row leaves the position at its pre-split value, which is a
+        plausible number with no error attached. Split is one of only two
+        order-sensitive types, which makes silence here expensive."""
+        for cost in ("", "0"):
+            with self.subTest(cost=cost):
+                path = _csv(_snapshot("Main", "ACME"),
+                            _txn("Main", "ACME", "Buy", 100, rid="2"),
+                            _txn("Main", "ACME", "Split", 2, rid="3", cost=cost))
+                try:
+                    blocks, _, problems = P.parse(path)
+                    self.assertEqual(problems.unapplicable_splits,
+                                     [("3", "Main", "ACME")])
+                    self.assertTrue(problems)
+                    self.assertEqual(blocks[0].net_shares(), 100.0,
+                                     "position stays pre-split — hence the report")
+                finally:
+                    os.unlink(path)
+
+    def test_valid_split_is_not_reported(self):
+        path = _csv(_snapshot("Main", "ACME"),
+                    _txn("Main", "ACME", "Buy", 100, rid="2"),
+                    _txn("Main", "ACME", "Split", 2, rid="3", cost="1"))
+        try:
+            blocks, _, problems = P.parse(path)
+            self.assertEqual(problems.unapplicable_splits, [])
+            self.assertEqual(blocks[0].net_shares(), 200.0)
+        finally:
+            os.unlink(path)
+
+    def test_thousands_separators_are_accepted(self):
+        for raw, want in [("1,234", 1234.0), ("1,234,567", 1234567.0),
+                          ("-1,234.56", -1234.56), ("999", 999.0)]:
+            with self.subTest(raw=raw):
+                errors = []
+                self.assertEqual(P._num(raw, on_error=errors.append), want)
+                self.assertEqual(errors, [])
+
+    def test_comma_that_is_not_a_thousands_separator_is_rejected(self):
+        """"1,5" is one-and-a-half under a comma-decimal locale. Stripping the
+        comma turns it into fifteen — a tenfold error with no signal. §8 lists
+        the locale assumption; this makes it audible instead of theoretical."""
+        for raw in ("1,5", "1,23", "12,34", "1,2345"):
+            with self.subTest(raw=raw):
+                errors = []
+                self.assertEqual(P._num(raw, on_error=errors.append), 0.0)
+                self.assertEqual(errors, [raw])
+
     def test_duplicate_pairs_are_reported_but_not_an_error(self):
         """Documented format behaviour (README §8), handled correctly by keeping
         both blocks — so it must not make the file 'bad'."""
@@ -370,6 +420,14 @@ class TestCommandLineExitCodes(unittest.TestCase):
         path = self._tmp(_snapshot("Main", "ACME"),
                          _txn("Main", "ACME", "Spinoff", 50, rid="2"))
         self.assertEqual(self._run(path, "--raw", "Main", "ACME").returncode, 1)
+
+    def test_undefined_split_exits_one(self):
+        path = self._tmp(_snapshot("Main", "ACME"),
+                         _txn("Main", "ACME", "Buy", 100, rid="2"),
+                         _txn("Main", "ACME", "Split", 2, rid="3", cost=""))
+        r = self._run(path)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("undefined ratio", r.stdout)
 
     def test_duplicate_pair_alone_exits_zero(self):
         path = self._tmp(_snapshot("Main", "ACME", rid="1"),
