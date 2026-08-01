@@ -37,7 +37,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+import argparse
 import csv
+import math
 import os
 import sys
 from collections import Counter, defaultdict
@@ -87,12 +89,21 @@ SPLIT_TYPES = {"Split"}
 # cannot follow, and every position derived from that block is suspect.
 KNOWN_TYPES = set(QTY_SIGN) | FLATTEN_TYPES | CASH_ONLY_TYPES | SPLIT_TYPES
 
-# Columns without which the file cannot be an MSP export. Resolving a missing
-# column to "" (which is what a name-based lookup naturally does) turns a wrong
-# file into a plausible-looking empty portfolio, exit code 0 and all — the exact
-# silent failure this specification is about.
-REQUIRED_COLUMNS = ("Id", "Symbol", "Portfolio", "Type",
-                    "Shares Owned", "Transaction Date")
+# Every column this parser reads. A name-based lookup resolves a missing column
+# to "", so an absent column does not raise — it changes the answer. Measured:
+# drop "Cost Per Share" and a 2-for-1 Split is skipped, turning a 150-share
+# position into 50; drop "Last Traded Price" and every market value becomes 0.
+# Both exited 0. So the check covers everything read, not just what identifies
+# the file.
+REQUIRED_COLUMNS = (
+    "Id", "Symbol", "Name", "Exchange", "Portfolio", "Currency",
+    "Last Traded Price", "Shares Owned", "Cost Per Share", "Commission",
+    "Transaction Date", "Transaction Time", "Type", "Accounting", "Notes",
+    "OutgoingCashLink",
+)
+# Deliberately NOT required — present in exports but never read here:
+#   "Display Symbol", "Purchase Exchange Rate", "Accounting Execution Ids",
+#   "Purchase Exchange Currencies" (absent from the 19-column version entirely).
 
 
 class NotAnMspExport(ValueError):
@@ -115,11 +126,20 @@ def _num(s, on_error=None):
     if not s:
         return 0.0
     try:
-        return float(s)
+        value = float(s)
     except ValueError:
         if on_error is not None:
             on_error(s)
         return 0.0
+    if not math.isfinite(value):
+        # float() accepts "NaN" and "Infinity" without complaint. A NaN in a
+        # share count propagates through every later addition, turns the whole
+        # position into nan, and compares false against everything — so it slips
+        # past most sanity checks instead of tripping them.
+        if on_error is not None:
+            on_error(s)
+        return 0.0
+    return value
 
 
 @dataclass
@@ -238,7 +258,15 @@ class Problems:
     duplicate_pairs: list = field(default_factory=list)  # (portfolio, symbol)
 
     def __bool__(self):
-        return bool(self.unparseable or self.unknown_types or self.duplicate_pairs)
+        """True when something is actually *wrong*.
+
+        `duplicate_pairs` is deliberately excluded. A (Portfolio, Symbol) pair
+        occupying two blocks is documented format behaviour (README §8), not a
+        defect, and this parser handles it correctly by keeping both. It is
+        reported so that callers who key on the pair are not caught out, but a
+        file containing one is not a bad file.
+        """
+        return bool(self.unparseable or self.unknown_types)
 
     def summary(self):
         bits = []
@@ -246,8 +274,6 @@ class Problems:
             bits.append(f"{len(self.unparseable)} unparseable numeric cell(s)")
         if self.unknown_types:
             bits.append(f"{len(self.unknown_types)} unrecognised transaction type(s)")
-        if self.duplicate_pairs:
-            bits.append(f"{len(self.duplicate_pairs)} duplicated (Portfolio, Symbol) pair(s)")
         return "; ".join(bits) or "none"
 
 
@@ -395,11 +421,14 @@ def _report_problems(problems, prefix="⚠"):
         for ttype, count in sorted(problems.unknown_types.items()):
             print(f"    {ttype!r}: {count} row(s)")
         print("    If the app added a type, this parser is out of date.")
+    # Not counted as an error: this is documented format behaviour and the parser
+    # handles it correctly by keeping both blocks. Reported so that a caller who
+    # keys on the pair is not caught out.
     if problems.duplicate_pairs:
-        n += len(problems.duplicate_pairs)
-        print(f"\n{prefix} {len(problems.duplicate_pairs)} (Portfolio, Symbol) pair(s) "
-              f"occupy more than one block. Anything that keys on the pair rather "
-              f"than iterating blocks will lose a position (README §8):")
+        print(f"\nnote: {len(problems.duplicate_pairs)} (Portfolio, Symbol) pair(s) "
+              f"occupy more than one block — normal for this format (README §8), "
+              f"but anything that keys on the pair rather than iterating blocks "
+              f"will lose a position:")
         for pf, sym in problems.duplicate_pairs[:5]:
             print(f"    {pf} / {sym}")
     return n
@@ -449,36 +478,44 @@ def self_test():
     return 1 if failures else 0
 
 
-def main():
-    args = sys.argv[1:]
-    if "--self-test" in args:
-        sys.exit(self_test())
-    if not args or args[0].startswith("-"):
-        print(__doc__)
-        sys.exit(1)
+def _argparser():
+    ap = argparse.ArgumentParser(
+        prog="msp_export_parser.py",
+        description="Parse a My Stocks Portfolio & Market CSV export.",
+        epilog="exit codes: 0 = clean, 1 = parsed but problems found, "
+               "2 = input unusable")
+    ap.add_argument("path", nargs="?", help="the exported CSV")
+    ap.add_argument("--self-test", action="store_true",
+                    help="check against the bundled example-export.csv and exit")
+    ap.add_argument("--portfolio", metavar="NAME",
+                    help="restrict the listing to one portfolio")
+    ap.add_argument("--raw", nargs=2, metavar=("PORTFOLIO", "SYMBOL"),
+                    help="dump every transaction of a single block")
+    return ap
 
-    path = args[0]
+
+def main():
+    # argparse rather than hand-rolled parsing: an unrecognised option used to be
+    # ignored outright, so a typo'd flag ran the default listing and exited 0.
+    ap = _argparser()
+    ns = ap.parse_args()
+
+    if ns.self_test:
+        sys.exit(self_test())
+    if not ns.path:
+        ap.error("a CSV path is required (or pass --self-test)")
+
     try:
-        blocks, header, problems = parse(path)
+        blocks, header, problems = parse(ns.path)
     except FileNotFoundError:
-        print(f"error: no such file: {path}", file=sys.stderr)
+        print(f"error: no such file: {ns.path}", file=sys.stderr)
         sys.exit(2)
     except NotAnMspExport as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(2)
 
-    def opt(flag, count=1):
-        if flag not in args:
-            return None
-        i = args.index(flag)
-        if i + count >= len(args):
-            print(f"error: {flag} needs {count} argument(s)", file=sys.stderr)
-            sys.exit(2)
-        return args[i + 1:i + 1 + count]
-
-    raw = opt("--raw", 2)
-    if raw:
-        pf, sym = raw
+    if ns.raw:
+        pf, sym = ns.raw
         hits = [b for b in blocks if (b.portfolio, b.symbol) == (pf, sym)]
         if not hits:
             print(f"error: no block for {pf} / {sym}", file=sys.stderr)
@@ -486,18 +523,25 @@ def main():
         for b in hits:
             print(f"[{b.portfolio}/{b.symbol}] {b.name} "
                   f"currency={b.currency} last={b.last_price}")
-            for t in b.txns:
-                print(f"  {t.id:>5s} {t.date} {t.ttype:18s} "
-                      f"shares={t.shares:>16,.4f} cost={t.cost:>12,.4f} "
-                      f"comm={t.commission:>8,.2f} {t.notes[:48]!r}")
+            for txn in b.txns:
+                print(f"  {txn.id:>5s} {txn.date} {txn.ttype:18s} "
+                      f"shares={txn.shares:>16,.4f} cost={txn.cost:>12,.4f} "
+                      f"comm={txn.commission:>8,.2f} {txn.notes[:48]!r}")
             print(f"  => net_shares={b.net_shares():,.4f}  "
                   f"market_value={b.market_value():,.2f} {b.currency}")
-        return
+        # This branch used to return early, skipping the check below entirely —
+        # so a file with unknown transaction types dumped happily with exit 0
+        # while the normal listing exited 1 on the very same file.
+        _report_problems(problems)
+        sys.exit(1 if problems else 0)
 
-    pf_filter = opt("--portfolio")
-    only = pf_filter[0] if pf_filter else None
+    names = {b.portfolio for b in blocks}
+    if ns.portfolio and ns.portfolio not in names:
+        print(f"error: no portfolio named {ns.portfolio!r}. Found: "
+              f"{', '.join(sorted(names))}", file=sys.stderr)
+        sys.exit(2)
 
-    print(f"file:    {path}")
+    print(f"file:    {ns.path}")
     print(f"columns: {len(header)}   blocks: {len(blocks)}   "
           f"transactions: {sum(len(b.txns) for b in blocks)}")
     links = cash_links(blocks)
@@ -507,7 +551,7 @@ def main():
     print()
 
     for pf, bs in sorted(by_portfolio(blocks).items()):
-        if only and pf != only:
+        if ns.portfolio and pf != ns.portfolio:
             continue
         print(f"{'=' * 78}\n[{pf}]  {len(bs)} symbols")
         for b in bs:
@@ -516,9 +560,8 @@ def main():
                   f"@{b.last_price:<12,.4f} mv={b.market_value():>16,.2f} "
                   f"{b.currency:4s} n={len(b.txns):<4d} {flows}")
 
-    # A file with problems still prints its positions — they are useful even when
-    # incomplete — but the exit code has to say so, or a script calling this will
-    # treat corrupted output as success.
+    # Positions still printed — partial output is useful — but the exit code has
+    # to say the result cannot be trusted, or a calling script treats it as good.
     if problems:
         print(f"\nexiting non-zero: {problems.summary()}")
         sys.exit(1)

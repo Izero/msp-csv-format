@@ -13,6 +13,8 @@ input has to produce a signal rather than a plausible-looking empty portfolio.
 Copyright 2026 Izero. Apache-2.0 — see LICENSE.
 """
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -20,6 +22,7 @@ import msp_export_parser as P
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXAMPLE = os.path.join(HERE, "example-export.csv")
+PARSER = os.path.join(HERE, "msp_export_parser.py")
 
 HEADER = ",".join(P.COLUMNS_REFERENCE)
 
@@ -260,6 +263,122 @@ class TestFailsLoudly(unittest.TestCase):
         _, _, problems = P.parse(EXAMPLE)
         self.assertFalse(problems)
         self.assertEqual(problems.summary(), "none")
+
+    def test_nan_and_infinity_are_rejected(self):
+        """float() accepts both without complaint; a NaN then poisons every
+        later sum and compares false against everything, so it slips past
+        sanity checks rather than tripping them."""
+        for bad in ("NaN", "Infinity", "-inf"):
+            with self.subTest(value=bad):
+                path = _csv(_snapshot("Main", "ACME"),
+                            _txn("Main", "ACME", "Buy", bad, rid="2"))
+                try:
+                    blocks, _, problems = P.parse(path)
+                    self.assertEqual(problems.unparseable, [("2", "Shares Owned", bad)])
+                    self.assertEqual(blocks[0].net_shares(), 0.0)
+                finally:
+                    os.unlink(path)
+
+    def test_every_column_the_parser_reads_is_required(self):
+        """Dropping a column changes the answer instead of raising, because a
+        name-based lookup resolves it to "". Measured: without Cost Per Share a
+        2-for-1 split is skipped and a 150-share position reads as 50."""
+        for column in P.REQUIRED_COLUMNS:
+            with self.subTest(missing=column):
+                cols = [c for c in P.COLUMNS_REFERENCE if c != column]
+                path = _csv(header=",".join(cols))
+                try:
+                    with self.assertRaises(P.NotAnMspExport) as cm:
+                        P.parse(path)
+                    self.assertIn(column, str(cm.exception))
+                finally:
+                    os.unlink(path)
+
+    def test_duplicate_pairs_are_reported_but_not_an_error(self):
+        """Documented format behaviour (README §8), handled correctly by keeping
+        both blocks — so it must not make the file 'bad'."""
+        path = _csv(_snapshot("Main", "ACME", rid="1"),
+                    _txn("Main", "ACME", "Buy", 10, rid="2"),
+                    _snapshot("Main", "ACME", rid="3"),
+                    _txn("Main", "ACME", "Buy", 5, rid="4"))
+        try:
+            _, _, problems = P.parse(path)
+            self.assertEqual(problems.duplicate_pairs, [("Main", "ACME")])
+            self.assertFalse(problems, "a duplicate pair alone must not be an error")
+        finally:
+            os.unlink(path)
+
+
+class TestCommandLineExitCodes(unittest.TestCase):
+    """0 = clean, 1 = parsed but problems, 2 = input unusable.
+
+    Exit codes are the contract for anything scripting this parser, and they are
+    not reachable from the API tests above — every defect fixed in this class was
+    an exit code that said "fine" about output that was not.
+    """
+
+    def _run(self, *args):
+        return subprocess.run([sys.executable, PARSER, *args],
+                              capture_output=True, text=True)
+
+    def _tmp(self, *rows, header=HEADER):
+        path = _csv(*rows, header=header)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_clean_file_exits_zero(self):
+        self.assertEqual(self._run(EXAMPLE).returncode, 0)
+
+    def test_self_test_exits_zero(self):
+        self.assertEqual(self._run("--self-test").returncode, 0)
+
+    def test_no_arguments_exits_two(self):
+        self.assertEqual(self._run().returncode, 2)
+
+    def test_missing_file_exits_two(self):
+        self.assertEqual(self._run("/nonexistent/nope.csv").returncode, 2)
+
+    def test_wrong_schema_exits_two(self):
+        path = self._tmp('"1","FOO","Main"', header="Id,Symbol,Portfolio")
+        r = self._run(path)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("does not look like an MSP export", r.stderr)
+
+    def test_unknown_option_exits_two(self):
+        """A hand-rolled parser ignored these outright and ran the default listing."""
+        r = self._run(EXAMPLE, "--bogus")
+        self.assertEqual(r.returncode, 2)
+
+    def test_unknown_portfolio_exits_two(self):
+        r = self._run(EXAMPLE, "--portfolio", "NoSuchAccount")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("no portfolio named", r.stderr)
+
+    def test_raw_on_missing_block_exits_two(self):
+        self.assertEqual(self._run(EXAMPLE, "--raw", "Nope", "NOPE").returncode, 2)
+
+    def test_unknown_type_exits_one(self):
+        path = self._tmp(_snapshot("Main", "ACME"),
+                         _txn("Main", "ACME", "Spinoff", 50, rid="2"))
+        r = self._run(path)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("unrecognised transaction type", r.stdout)
+
+    def test_raw_does_not_bypass_the_problem_check(self):
+        """--raw used to return before the check, so the same file exited 0 here
+        and 1 through the normal listing."""
+        path = self._tmp(_snapshot("Main", "ACME"),
+                         _txn("Main", "ACME", "Spinoff", 50, rid="2"))
+        self.assertEqual(self._run(path, "--raw", "Main", "ACME").returncode, 1)
+
+    def test_duplicate_pair_alone_exits_zero(self):
+        path = self._tmp(_snapshot("Main", "ACME", rid="1"),
+                         _txn("Main", "ACME", "Buy", 10, rid="2"),
+                         _snapshot("Main", "ACME", rid="3"),
+                         _txn("Main", "ACME", "Buy", 5, rid="4"))
+        r = self._run(path)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("note:", r.stdout)
 
 
 if __name__ == "__main__":

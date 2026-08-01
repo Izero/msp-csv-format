@@ -48,7 +48,7 @@ Every claim is tagged with how it is known:
 ## Quick start
 
 ```bash
-python3 -m unittest          # 23 tests
+python3 -m unittest          # 37 tests
 python3 msp_export_parser.py --self-test
 ```
 
@@ -80,13 +80,30 @@ python3 msp_export_parser.py path/to/export.csv --raw Margin EURUSD=X
 Python 3.9+, standard library only. (3.9 is the oldest version CI actually runs;
 the code uses nothing newer, but nothing older has been tested either.)
 
-**On bad input the parser is loud, by design.** A file missing columns every
-export has raises `NotAnMspExport` and the CLI exits 2 — an earlier version
-parsed a three-column CSV into a set of empty positions and exited 0. Rows the
-parser cannot act on (an unparseable number, a transaction type it does not
-recognise) are collected into a `Problems` object, printed, and turned into a
-non-zero exit. Positions are still shown, because partial output is useful, but
-nothing pretends the result is complete.
+**On bad input the parser is loud, by design.**
+
+| Exit | Meaning |
+|---|---|
+| `0` | Parsed cleanly. The positions can be trusted as far as this spec goes |
+| `1` | Parsed, but something is wrong — positions are printed *and* the problems with them |
+| `2` | Input unusable: not an MSP export, empty, unreadable, or bad arguments |
+
+`parse()` requires **every column it reads**, not just the ones that identify
+the file. That distinction was worth measuring: with `Cost Per Share` absent a
+`Split` is skipped and a 150-share position reads as 50; with `Last Traded Price`
+absent every market value becomes 0. Both used to exit 0. A name-based column
+lookup resolves a missing column to `""`, so an absent column does not raise on
+its own — it changes the answer.
+
+Things that cannot be acted on — an unparseable number, `NaN` or `Infinity`
+(which `float()` accepts happily), a transaction type the parser does not
+recognise — go into a `Problems` object, get printed, and force exit 1.
+Positions are still shown, because partial output is useful; nothing pretends
+the result is complete.
+
+One case is reported but *not* an error: a `(Portfolio, Symbol)` pair occupying
+two blocks (§8). That is documented format behaviour, handled correctly by
+keeping both blocks, so it prints a `note:` and exits 0.
 
 ## 1. File structure
 
