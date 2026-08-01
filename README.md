@@ -48,13 +48,16 @@ Every claim is tagged with how it is known:
 ## Quick start
 
 ```bash
-python3 -m unittest          # 56 tests
+python3 -m unittest          # 62 tests
 python3 msp_export_parser.py --self-test
 ```
 
-Both run against `example-export.csv`, a synthetic file that exercises every
-transaction type and every trap documented below. The self-test needs no test
-runner, and fails if the example ever stops covering a type:
+Both run against `example-export.csv`, a synthetic file exercising every
+transaction type and every trap **a single file can demonstrate**. Some cannot
+be: `Id` renumbering needs two exports (§7), the locale question needs a
+differently-configured device, and float precision is not a file property at
+all. The self-test needs no test runner, and fails if the example ever stops
+covering a transaction type:
 
 ```
 parsed 6 blocks, 16 transactions, 20 columns
@@ -66,8 +69,16 @@ parsed 6 blocks, 16 transactions, 20 columns
   ok   Main     ^GSPC      net=      250.00
   ok   Margin   CHFUSD=X   net=        0.00
 
+note: 1 non-numeric cell(s) in Commission — read as 0. No position depends on
+these columns; real exports do contain such values (§8):
+    Id 2 Commission: '0.5%'
+
 all expectations met
 ```
+
+That `note:` is deliberate. The example carries a percentage in `Commission`
+because real exports do, and it exits 0 — a notice says "worth knowing", not
+"your numbers are wrong".
 
 Against your own export:
 
@@ -95,11 +106,18 @@ absent every market value becomes 0. Both used to exit 0. A name-based column
 lookup resolves a missing column to `""`, so an absent column does not raise on
 its own — it changes the answer.
 
-Things that cannot be acted on — an unparseable number, `NaN` or `Infinity`
-(which `float()` accepts happily), a transaction type the parser does not
-recognise — go into a `Problems` object, get printed, and force exit 1.
-Positions are still shown, because partial output is useful; nothing pretends
-the result is complete.
+Things that cannot be acted on go into a `Problems` object, get printed, and
+force exit 1: an unparseable number **in a column a position depends on**
+(`Shares Owned`, `Cost Per Share`, `Last Traded Price`), `NaN` or `Infinity`
+(which `float()` accepts happily), or a transaction type the parser does not
+recognise. Positions are still shown, because partial output is useful; nothing
+pretends the result is complete.
+
+A non-numeric cell in any *other* column is a notice instead. That distinction
+exists because of §8's `Commission` finding: real exports contain percentage
+strings there, no position depends on the column, and grading it as an error
+would mean a healthy export never exits 0 — which teaches people to ignore the
+exit code.
 
 The parser also checks the structural claims this document makes about the file
 rather than assuming them: unique non-blank `Id`s (§1, which cash-link
@@ -108,10 +126,12 @@ duplicate shadows the first silently), every block having its snapshot row (a
 block without one carries no price, so its market values are all 0), and every
 `OutgoingCashLink` resolving inside the file (§5).
 
-Two things are reported as `note:` and exit 0, because they are documented
-behaviour or change nothing: a `(Portfolio, Symbol)` pair occupying two blocks
-(§8), and `Id`s that are not monotonically increasing — §1 records them as
-increasing, but nothing here depends on it.
+Reported as `note:`, exit 0 — documented behaviour, or deviations that change
+no number: a `(Portfolio, Symbol)` pair occupying two blocks (§8); non-numeric
+cells outside the position-critical columns; `Id`s that are not integers or not
+monotonically increasing (§1 records both, nothing here depends on either); and
+cash links crossing portfolios, which §5 never observed but which move no
+position.
 
 ## 1. File structure
 

@@ -362,6 +362,79 @@ class TestFailsLoudly(unittest.TestCase):
                 self.assertEqual(P._num(raw, on_error=errors.append), 0.0)
                 self.assertEqual(errors, [raw])
 
+    def test_unparseable_is_graded_by_column(self):
+        """§8 records percentage strings in Commission as real export data. If
+        that graded as an error, a healthy export would never exit 0 — which
+        teaches people to ignore the exit code."""
+        critical = _csv(_snapshot("Main", "ACME"),
+                        _txn("Main", "ACME", "Buy", "n/a", rid="2"))
+        try:
+            _, _, problems = P.parse(critical)
+            self.assertEqual(len(problems.unparseable), 1)
+            self.assertTrue(problems, "Shares Owned decides a position")
+        finally:
+            os.unlink(critical)
+
+        incidental = _csv(
+            _snapshot("Main", "ACME"),
+            _row(Id="2", Symbol="ACME", Portfolio="Main", Type="Buy", Currency="USD",
+                 **{"Shares Owned": "100", "Cost Per Share": "1",
+                    "Commission": "0.5%", "Last Traded Price": "10",
+                    "Transaction Date": "2024-01-01 GMT+0800"}))
+        try:
+            blocks, _, problems = P.parse(incidental)
+            self.assertEqual(problems.unparseable, [])
+            self.assertEqual(len(problems.unparseable_incidental), 1)
+            self.assertFalse(problems, "no position depends on Commission")
+            self.assertEqual(blocks[0].net_shares(), 100.0)
+        finally:
+            os.unlink(incidental)
+
+    def test_snapshot_without_identity_is_an_error(self):
+        """A snapshot with no Symbol or Portfolio still opens a block, and its
+        contents print as "[]  1 symbols"."""
+        path = _csv(_row(Id="1", Symbol="", Portfolio="", Currency="USD",
+                         **{"Last Traded Price": "10"}))
+        try:
+            _, _, problems = P.parse(path)
+            self.assertEqual(problems.incomplete_snapshots,
+                             [(2, ["Symbol", "Portfolio"])])
+            self.assertTrue(problems)
+        finally:
+            os.unlink(path)
+
+    def test_non_numeric_id_is_a_notice(self):
+        """i.isdigit() excluded these from the ordering check, so they were
+        invisible — but §1 records Id as a positive integer."""
+        path = _csv(_snapshot("Main", "ACME", rid="abc"),
+                    _txn("Main", "ACME", "Buy", 10, rid="xyz"))
+        try:
+            _, _, problems = P.parse(path)
+            self.assertEqual([i for _, i in problems.non_numeric_ids], ["abc", "xyz"])
+            self.assertFalse(problems)
+        finally:
+            os.unlink(path)
+
+    def test_cross_portfolio_cash_link_is_a_notice(self):
+        """§5 observed every pairing inside one portfolio. A crossing one moves
+        no position, so it is worth saying without being an error."""
+        path = _csv(
+            _snapshot("A", "ACME"),
+            _row(Id="2", Symbol="ACME", Portfolio="A", Type="Buy", Currency="USD",
+                 **{"Shares Owned": "1", "Cost Per Share": "1", "Last Traded Price": "10",
+                    "Transaction Date": "2024-01-01 GMT+0800", "OutgoingCashLink": "4"}),
+            _snapshot("B", "USD=CASH", rid="3"),
+            _row(Id="4", Symbol="USD=CASH", Portfolio="B", Type="Sell", Currency="USD",
+                 **{"Shares Owned": "1", "Cost Per Share": "1", "Last Traded Price": "1",
+                    "Transaction Date": "2024-01-01 GMT+0800"}))
+        try:
+            _, _, problems = P.parse(path)
+            self.assertEqual(problems.cross_portfolio_links, [("2", "A", "B")])
+            self.assertEqual(problems.unresolved_links, [])
+            self.assertFalse(problems)
+        finally:
+            os.unlink(path)
+
     def test_duplicate_pairs_are_reported_but_not_an_error(self):
         """Documented format behaviour (README §8), handled correctly by keeping
         both blocks — so it must not make the file 'bad'."""
@@ -564,6 +637,22 @@ class TestCommandLineExitCodes(unittest.TestCase):
         r = self._run(path)
         self.assertEqual(r.returncode, 0)
         self.assertIn("not monotonically increasing", r.stdout)
+
+    def test_percentage_commission_exits_zero_with_a_note(self):
+        path = self._tmp(
+            _snapshot("Main", "ACME"),
+            _row(Id="2", Symbol="ACME", Portfolio="Main", Type="Buy", Currency="USD",
+                 **{"Shares Owned": "100", "Cost Per Share": "1", "Commission": "0.5%",
+                    "Last Traded Price": "10",
+                    "Transaction Date": "2024-01-01 GMT+0800"}))
+        r = self._run(path)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("note:", r.stdout)
+
+    def test_snapshot_without_identity_exits_one(self):
+        path = self._tmp(_row(Id="1", Symbol="", Portfolio="", Currency="USD",
+                              **{"Last Traded Price": "10"}))
+        self.assertEqual(self._run(path).returncode, 1)
 
     def test_directory_argument_exits_two(self):
         """The exit-code table promises 2 for unreadable input; a directory

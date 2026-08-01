@@ -107,6 +107,15 @@ REQUIRED_COLUMNS = (
 #   "Purchase Exchange Currencies" (absent from the 19-column version entirely).
 
 
+# An unparseable cell in one of these changes a number. Anywhere else it does
+# not — Commission feeds only total_commission(), which no position depends on —
+# and real exports genuinely contain non-numeric Commission cells (§8). Treating
+# those as errors would mean a healthy export never exits 0, which trains people
+# to ignore the exit code.
+POSITION_CRITICAL_COLUMNS = frozenset({
+    "Shares Owned", "Cost Per Share", "Last Traded Price"})
+
+
 class NotAnMspExport(ValueError):
     """The file is missing columns an MSP export always has."""
 
@@ -287,10 +296,13 @@ class Block:
 class Problems:
     """Everything the parser noticed but could not fix.
 
-    Empty is the healthy state. Anything here means some position may be wrong,
-    and the caller has to decide what to do about it. The point of collecting
-    these rather than swallowing them is that all three failure modes below are
-    otherwise completely silent — the file parses, exit code is 0, and the
+    Split in two. **Errors** mean a number may be wrong; `bool(problems)` reads
+    only these, and the CLI exits non-zero on them. **Notices** are things worth
+    knowing that change no number: documented format behaviour, or a deviation
+    from what §1 records with no consequence for the arithmetic.
+
+    The point of collecting any of it is that every failure mode here is
+    otherwise completely silent — the file parses, the exit code is 0, and the
     numbers are simply incorrect.
     """
     # --- errors: something is wrong and the numbers may be affected ---
@@ -301,11 +313,15 @@ class Problems:
     duplicate_ids: list = field(default_factory=list)   # (id, occurrences)
     blank_ids: list = field(default_factory=list)      # line numbers
     orphan_blocks: list = field(default_factory=list)  # (portfolio, symbol)
+    incomplete_snapshots: list = field(default_factory=list)  # (line, [fields])
     unresolved_links: list = field(default_factory=list)  # (source_id, target_id)
 
     # --- notices: documented behaviour, or deviations that change nothing ---
+    unparseable_incidental: list = field(default_factory=list)  # (row_id, col, raw)
     duplicate_pairs: list = field(default_factory=list)  # (portfolio, symbol)
     non_monotonic_ids: list = field(default_factory=list)  # (previous, current)
+    non_numeric_ids: list = field(default_factory=list)  # (line, id)
+    cross_portfolio_links: list = field(default_factory=list)  # (src_id, from, to)
 
     def __bool__(self):
         """True when something is actually *wrong*.
@@ -319,7 +335,8 @@ class Problems:
         return bool(self.unparseable or self.unknown_types
                     or self.unapplicable_splits or self.malformed_rows
                     or self.duplicate_ids or self.blank_ids
-                    or self.orphan_blocks or self.unresolved_links)
+                    or self.orphan_blocks or self.unresolved_links
+                    or self.incomplete_snapshots)
 
     def summary(self):
         bits = []
@@ -335,6 +352,9 @@ class Problems:
             bits.append(f"{len(self.blank_ids)} row(s) with a blank Id")
         if self.orphan_blocks:
             bits.append(f"{len(self.orphan_blocks)} block(s) with no snapshot row")
+        if self.incomplete_snapshots:
+            bits.append(f"{len(self.incomplete_snapshots)} snapshot row(s) missing "
+                        f"an identifying field")
         if self.unresolved_links:
             bits.append(f"{len(self.unresolved_links)} unresolved cash link(s)")
         if self.malformed_rows:
@@ -391,7 +411,6 @@ def parse(path):
 
     idx = {name: i for i, name in enumerate(header)}
     problems = Problems()
-    warnings = problems.unparseable
 
     def get(row, name):
         i = idx.get(name)
@@ -400,8 +419,13 @@ def parse(path):
         return row[i].strip()
 
     def num(row, name):
-        return _num(get(row, name),
-                    on_error=lambda v: warnings.append((get(row, "Id") or "?", name, v)))
+        def record(raw):
+            entry = (get(row, "Id") or "?", name, raw)
+            if name in POSITION_CRITICAL_COLUMNS:
+                problems.unparseable.append(entry)
+            else:
+                problems.unparseable_incidental.append(entry)
+        return _num(get(row, name), on_error=record)
 
     blocks = []
     current = None
@@ -417,6 +441,12 @@ def parse(path):
             continue
         all_ids.append((line_no, get(row, "Id")))
         if not get(row, "Transaction Date"):
+            blank = [c for c in ("Symbol", "Portfolio") if not get(row, c)]
+            if blank:
+                # A snapshot with no Symbol or Portfolio still opens a block, and
+                # everything beneath it lands in a nameless bucket that prints as
+                # "[]  1 symbols" and exits 0.
+                problems.incomplete_snapshots.append((line_no, blank))
             current = Block(
                 portfolio=get(row, "Portfolio"),
                 symbol=get(row, "Symbol"),
@@ -466,6 +496,8 @@ def parse(path):
     # §1 also claims Ids increase monotonically. Nothing here depends on that, so
     # a violation is reported as a notice: it means the file is not quite what the
     # specification describes, without making any number wrong.
+    problems.non_numeric_ids = [(line, i) for line, i in all_ids
+                                if i and not i.isdigit()]
     numeric = [(line, int(i)) for line, i in all_ids if i.isdigit()]
     problems.non_monotonic_ids = [(numeric[k - 1][1], numeric[k][1])
                                   for k in range(1, len(numeric))
@@ -482,8 +514,15 @@ def parse(path):
     # §5 and §7 record every link in the sample resolving inside its own file.
     # One that does not means the pairing data is incomplete — it does not move
     # a position, but it is not the format behaving as documented either.
+    resolved = cash_links(blocks)
     problems.unresolved_links = [(src.id, src.cash_link)
-                                 for src, tgt in cash_links(blocks) if tgt is None]
+                                 for src, tgt in resolved if tgt is None]
+    # §5 records every pairing in the sample sitting inside one portfolio, with no
+    # cross-portfolio link observed at all. One that crosses moves no position, so
+    # it is a notice — but the cash-flow reading of §5 does not hold for that file.
+    problems.cross_portfolio_links = [
+        (src.id, src.portfolio, tgt.portfolio) for src, tgt in resolved
+        if tgt is not None and src.portfolio != tgt.portfolio]
 
     return blocks, header, problems
 
@@ -571,6 +610,13 @@ def _report_problems(problems, prefix="⚠"):
               f"states every row consumes a unique Id, and cash-link resolution "
               f"needs it:")
         print(f"    line(s) {', '.join(str(x) for x in problems.blank_ids[:15])}")
+    if problems.incomplete_snapshots:
+        n += len(problems.incomplete_snapshots)
+        print(f"\n{prefix} {len(problems.incomplete_snapshots)} snapshot row(s) with "
+              f"no Symbol or no Portfolio. They still open a block, so everything "
+              f"beneath them lands in a bucket with no name:")
+        for line_no, fields in problems.incomplete_snapshots[:10]:
+            print(f"    line {line_no}: blank {', '.join(fields)}")
     if problems.duplicate_ids:
         n += len(problems.duplicate_ids)
         print(f"\n{prefix} {len(problems.duplicate_ids)} duplicated Id(s). §1 states "
@@ -587,6 +633,26 @@ def _report_problems(problems, prefix="⚠"):
             print(f"    {ttype!r}: {count} row(s)")
         print("    If the app added a type, this parser is out of date.")
     # Notices below: nothing here makes a number wrong.
+    if problems.unparseable_incidental:
+        cols = sorted({c for _, c, _ in problems.unparseable_incidental})
+        print(f"\nnote: {len(problems.unparseable_incidental)} non-numeric cell(s) "
+              f"in {', '.join(cols)} — read as 0. No position depends on these "
+              f"columns; real exports do contain such values (§8):")
+        for row_id, col, raw in problems.unparseable_incidental[:5]:
+            print(f"    Id {row_id} {col}: {raw!r}")
+        if len(problems.unparseable_incidental) > 5:
+            print(f"    ... and {len(problems.unparseable_incidental) - 5} more")
+    if problems.non_numeric_ids:
+        print(f"\nnote: {len(problems.non_numeric_ids)} Id(s) are not integers "
+              f"(first: {problems.non_numeric_ids[0][1]!r} on line "
+              f"{problems.non_numeric_ids[0][0]}). §1 records Id as a positive "
+              f"integer; these are excluded from the ordering check.")
+    if problems.cross_portfolio_links:
+        print(f"\nnote: {len(problems.cross_portfolio_links)} cash link(s) cross "
+              f"portfolios. §5 records every pairing in the sample staying inside "
+              f"one portfolio, so this file reads differently for cash flow:")
+        for src_id, a, b in problems.cross_portfolio_links[:5]:
+            print(f"    Id {src_id}: {a} → {b}")
     if problems.non_monotonic_ids:
         first_prev, first_cur = problems.non_monotonic_ids[0]
         print(f"\nnote: Id is not monotonically increasing "

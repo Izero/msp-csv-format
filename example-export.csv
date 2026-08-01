@@ -1,7 +1,7 @@
 Id,Symbol,Name,Display Symbol,Exchange,Portfolio,Currency,Last Traded Price,Shares Owned,Cost Per Share,Commission,Transaction Date,Transaction Time,Purchase Exchange Rate,Purchase Exchange Currencies,Type,Accounting,Accounting Execution Ids,Notes,OutgoingCashLink
 ,,,,,,,,,,,,,,,,,,,
 "1","ACME","Acme Corporation",,"NMS","Main","USD","65.00",,,,,,,,,,,,
-"2","ACME","Acme Corporation",,"NMS","Main","USD","65.00","100","50.00","1.00","2024-03-15 GMT+0800","09:31:00",,,"Buy",,,"initial position","10"
+"2","ACME","Acme Corporation",,"NMS","Main","USD","65.00","100","50.00","0.5%","2024-03-15 GMT+0800","09:31:00",,,"Buy",,,"Commission is not always numeric - a rate turns up where a fee is expected","10"
 "3","ACME","Acme Corporation",,"NMS","Main","USD","65.00","2","1","0.00","2024-06-01 GMT+0800","00:00:00",,,"Split",,,"2-for-1 split: shares:cost = new:old",
 "4","ACME","Acme Corporation",,"NMS","Main","USD","65.00","45.00","0","0.00","2024-09-10 GMT+0800","00:00:00",,,"Dividend",,,"quarterly dividend - amount, NOT share count","11"
 "5","ACME","Acme Corporation",,"NMS","Main","USD","65.00","50","62.00","1.00","2025-01-20 GMT+0800","14:02:00",,,"Sell","FIFO",,"trim",
