@@ -1,0 +1,28 @@
+name: self-test
+
+# The parser ships with a self-test and a synthetic export that covers every
+# transaction type and every documented trap. Running it on every push is what
+# keeps example-export.csv from quietly rotting, and what makes the "Python 3.9+"
+# claim in the README an actual verified fact rather than an assertion.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run self-test
+        run: python msp_export_parser.py --self-test
+      - name: Parse the example through the normal CLI path
+        run: python msp_export_parser.py example-export.csv

@@ -40,7 +40,7 @@ limitations under the License.
 import csv
 import os
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 # Column names seen in a 2026 export, for reference only.
@@ -68,10 +68,11 @@ QTY_SIGN = {
 }
 
 # Types that flatten the position to zero.
-# *** The "Shares Owned" column is NOT usable for these. *** In one real-world
-# export containing 105 such rows: 100 had shares=0, 4 held the pre-close balance,
-# and 1 was off by a rounding tail. Treating the column as a delta produces
-# phantom positions that never raise an error. See README "The Sell All trap".
+# *** The "Shares Owned" column is NOT usable for these. *** Across the rows of
+# this type in one real-world export: the overwhelming majority held 0, a handful
+# held the pre-close balance, one was off by a rounding tail. Treating the column
+# as a delta produces phantom positions that never raise an error.
+# See README "The Sell All trap".
 FLATTEN_TYPES = {"Sell All", "Buy to Cover All"}
 
 # Types where "Shares Owned" is a CASH AMOUNT, not a share count. They do not
@@ -82,14 +83,26 @@ CASH_ONLY_TYPES = {"Dividend", "Interest"}
 SPLIT_TYPES = {"Split"}
 
 
-def _num(s):
-    """Parse a numeric cell. Blank, malformed, or missing all become 0.0."""
+def _num(s, on_error=None):
+    """Parse a numeric cell.
+
+    An empty cell is a legitimate zero. A cell that is present but unparseable is
+    *data loss*. Collapsing both to 0.0 with no signal is precisely the failure
+    mode this specification spends its length warning about, so the two are kept
+    apart: `on_error` is called with the raw value when a non-empty cell fails.
+
+    ⚠ Number format is assumed to be "." decimal separator, "," thousands
+    separator (discardable). This has not been checked on a device whose locale
+    reverses the two. See README §8. [Unconfirmed]
+    """
     s = (s or "").strip().replace(",", "")
     if not s:
         return 0.0
     try:
         return float(s)
     except ValueError:
+        if on_error is not None:
+            on_error(s)
         return 0.0
 
 
@@ -158,6 +171,14 @@ class Block:
         Correct for futures and index positions too: "Shares Owned" stores
         (value per point x contracts), so the product is already the notional.
         Do not multiply by a contract multiplier again.
+
+        ⚠ **Only trust this for kinds you have verified yourself.** `kind()`
+        classifies by symbol shape, and a futures contract whose ticker lacks the
+        `=F` suffix is indistinguishable from an ordinary security — which is
+        exactly the case where the product is not the notional (README §6 records
+        one such counter-example). Symbol shape cannot detect this; it is a limit
+        of the format, not a fixable bug. The symptom is a value off by an exact
+        integer factor (the contract multiplier).
         """
         return self.net_shares() * self.last_price
 
@@ -174,19 +195,34 @@ class Block:
 
 
 def parse(path):
-    """Parse an MSP export. Returns (blocks, header). Blocks keep file order."""
+    """Parse an MSP export. Returns (blocks, header, warnings). Blocks keep file order.
+
+    `warnings` is a list of `(row_id, column, raw_value)` for cells that were
+    present but could not be parsed as a number. An empty list is the healthy
+    state. Anything in it means a value was replaced by 0.0, so some derived
+    position may be wrong — surface it rather than letting it pass.
+
+    **Rows within a block are replayed in file order.** In every export examined
+    that order matched `Transaction Date` order exactly, but the app does not
+    document any ordering guarantee. See README §1. [Unconfirmed]
+    """
     with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.reader(f)
         header = [h.strip() for h in next(reader)]
         rows = list(reader)
 
     idx = {name: i for i, name in enumerate(header)}
+    warnings = []
 
     def get(row, name):
         i = idx.get(name)
         if i is None or i >= len(row):
             return ""
         return row[i].strip()
+
+    def num(row, name):
+        return _num(get(row, name),
+                    on_error=lambda v: warnings.append((get(row, "Id") or "?", name, v)))
 
     blocks = []
     current = None
@@ -200,7 +236,7 @@ def parse(path):
                 name=get(row, "Name"),
                 exchange=get(row, "Exchange"),
                 currency=get(row, "Currency"),
-                last_price=_num(get(row, "Last Traded Price")),
+                last_price=num(row, "Last Traded Price"),
             )
             blocks.append(current)
             continue
@@ -210,9 +246,9 @@ def parse(path):
             portfolio=get(row, "Portfolio"),
             symbol=get(row, "Symbol"),
             ttype=get(row, "Type"),
-            shares=_num(get(row, "Shares Owned")),
-            cost=_num(get(row, "Cost Per Share")),
-            commission=_num(get(row, "Commission")),
+            shares=num(row, "Shares Owned"),
+            cost=num(row, "Cost Per Share"),
+            commission=num(row, "Commission"),
             date=get(row, "Transaction Date")[:10],
             time=get(row, "Transaction Time"),
             currency=get(row, "Currency"),
@@ -230,7 +266,7 @@ def parse(path):
             blocks.append(current)
         current.txns.append(txn)
 
-    return blocks, header
+    return blocks, header, warnings
 
 
 def by_portfolio(blocks):
@@ -267,7 +303,7 @@ def self_test():
     if not os.path.exists(path):
         print(f"example-export.csv not found next to this script ({path})")
         return 1
-    blocks, header = parse(path)
+    blocks, header, warnings = parse(path)
     print(f"parsed {len(blocks)} blocks, {sum(len(b.txns) for b in blocks)} transactions, "
           f"{len(header)} columns\n")
     failures = 0
@@ -278,6 +314,14 @@ def self_test():
         failures += 0 if ok else 1
         print(f"  {'ok  ' if ok else 'FAIL'} {b.portfolio:8s} {b.symbol:10s} "
               f"net={got:>12,.2f}" + ("" if ok else f"  expected {want:,.2f}"))
+    # A synthetic file must parse cleanly. Counting warnings as failures keeps
+    # example-export.csv from rotting unnoticed.
+    if warnings:
+        print(f"\n  FAIL {len(warnings)} unparseable numeric cell(s):")
+        for row_id, col, raw in warnings[:10]:
+            print(f"       Id {row_id} column {col!r}: {raw!r}")
+        failures += len(warnings)
+
     print("\nall expectations met" if not failures else f"\n{failures} failure(s)")
     return 1 if failures else 0
 
@@ -291,7 +335,7 @@ def main():
         sys.exit(1)
 
     path = args[0]
-    blocks, header = parse(path)
+    blocks, header, warnings = parse(path)
 
     if "--raw" in args:
         i = args.index("--raw")
@@ -315,7 +359,25 @@ def main():
           f"transactions: {sum(len(b.txns) for b in blocks)}")
     links = cash_links(blocks)
     print(f"cash links: {len(links)} "
-          f"({sum(1 for _, tgt in links if tgt is None)} unresolved)\n")
+          f"({sum(1 for _, tgt in links if tgt is None)} unresolved)")
+
+    # Two things worth surfacing rather than letting the caller discover them
+    # the hard way. Both are documented in README §8.
+    if warnings:
+        print(f"\n⚠ {len(warnings)} numeric cell(s) present but unparseable — each "
+              f"was replaced by 0.0, so some position below may be wrong:")
+        for row_id, col, raw in warnings[:10]:
+            print(f"    Id {row_id} column {col!r}: {raw!r}")
+        if len(warnings) > 10:
+            print(f"    ... and {len(warnings) - 10} more")
+
+    dupes = [k for k, n in Counter((b.portfolio, b.symbol) for b in blocks).items() if n > 1]
+    if dupes:
+        print(f"\n⚠ {len(dupes)} (Portfolio, Symbol) pair(s) appear as more than one "
+              f"block. Anything that assumes one block per pair will lose a position:")
+        for pf, sym in dupes[:5]:
+            print(f"    {pf} / {sym}")
+    print()
 
     for pf, bs in sorted(by_portfolio(blocks).items()):
         if only and pf != only:

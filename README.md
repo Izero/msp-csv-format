@@ -31,9 +31,9 @@ it to a tax tool, reconcile it against a broker statement — you work the forma
 out yourself first. This document is that work, written down, so the next person
 doesn't have to repeat it. Everything here was inferred by cross-checking
 exports against each other and against what the app displays — a single real
-portfolio, ~6,900 transactions across ~36 portfolios, 11 weekly exports, plus the
-public translation strings. Nothing was taken from a specification, because there
-isn't one.
+portfolio, several thousand transactions across a few dozen portfolios, eleven
+weekly exports, plus the public translation strings. Nothing was taken from a
+specification, because there isn't one.
 
 Every claim is tagged with how it is known:
 
@@ -71,7 +71,8 @@ python3 msp_export_parser.py path/to/export.csv --portfolio Main
 python3 msp_export_parser.py path/to/export.csv --raw Margin EURUSD=X
 ```
 
-Python 3.8+, standard library only.
+Python 3.9+, standard library only. (3.9 is the oldest version CI actually runs;
+the code uses nothing newer, but nothing older has been tested either.)
 
 ## 1. File structure
 
@@ -96,9 +97,53 @@ Id,Symbol,Name,...,OutgoingCashLink       <- header (1 line)
 - `Id` is unique and monotonically increasing **within one file**; snapshot rows
   consume an Id too. It is **renumbered between exports** — see §7. [Verified]
 
-**Column count varies by app version.** A 2026-05 export had 19 columns; a 2026-07
-export had 20, the new one being `Purchase Exchange Currencies` (empty throughout).
-**Resolve columns by header name. Never hardcode indices.** [Verified]
+**Column count varies by app version.** Earlier exports in the sample had 19
+columns; later ones had 20, the new one being `Purchase Exchange Currencies`
+(empty throughout). **Resolve columns by header name. Never hardcode indices.**
+[Verified]
+
+### Row order within a block
+
+**Transactions are replayed in file order.** Whether the app guarantees that this
+matches `Transaction Date` order is undocumented, and it matters more than it
+looks. `Buy` / `Sell` / `Sell Short` / `Buy to Cover` / `Dividend` / `Interest`
+are order-insensitive — addition commutes. `Sell All` / `Buy to Cover All`
+(flatten) and `Split` (multiply) are not. Every position this document describes
+rests on the replay-in-file-order assumption, and the flattening types are the
+whole point of the document.
+
+What the data shows: across eleven exports, **every** multi-transaction block was
+already in ascending date order, no exceptions — and no flattening row was ever
+followed by a transaction dated earlier than itself. So the assumption held
+everywhere it could be tested. [Verified]
+
+Whether it is *guaranteed* is a different question, and the answer is unknown.
+[Unconfirmed] All eleven exports reflect one person's data-entry habits. Someone
+who back-dates a transaction may well get a different layout.
+
+⚠ **Sorting by `(Transaction Date, Transaction Time)` is not a safe substitute.**
+A `Sell All` and a `Buy` carrying the same date and the same time have no defined
+order between them, and picking either silently changes the answer.
+
+To settle it for your own data: add a transaction dated *earlier* than an existing
+`Sell All` in the same block, re-export, and see where the app puts it.
+
+### Versions observed
+
+Everything here comes from the exports below. If yours falls outside this range —
+different platform, different app version, different column count — treat every
+claim as a starting hypothesis rather than a fact.
+
+| Columns | Share of the sample | App version | Platform |
+|---|---|---|---|
+| 19 | the earlier exports | unknown | iOS |
+| 20 | the later exports, including the most recent | `2.522.0` (most recent only) | iOS |
+| — | never examined | — | **Android (`co.peeksoft.stocks`)** |
+
+**The app version is not recorded anywhere in the CSV**, so only the most recent
+export can be tied to a version with any certainty. The earlier ones were produced
+by whatever version was current at the time, which is not recoverable from the
+files.
 
 ## 2. Columns
 
@@ -157,25 +202,44 @@ official documentation.** Their semantics below are from data.
 | `Interest` | **none** | **cash amount** | [Verified] |
 | `Split` | **× shares ÷ cost** | numerator of the ratio | [Verified] |
 
+### Sign convention
+
+`Shares Owned` is a **signed** value, and its sign is independent of `Type`. The
+net effect is `direction(Type) × value`, so a negative value reverses whatever
+direction the type would normally imply.
+
+In one real export, negative values appeared on five of the ten types — including
+`Buy` and `Sell`. **Every single one was on a `=CASH` block; not one was on a real
+security.** [Verified] The typical case is a `Buy USD=CASH` row carrying a negative
+amount, used to record an outflow.
+
+For implementers this means: do not take the absolute value, and do not assume the
+column is unsigned. A `Sell` row carrying a negative value has to reduce the
+position by a negative amount — that is, increase it — because that is what the
+person entering it meant. Applying `−1` to `abs(value)` gets the direction right
+by accident on most rows and wrong on those.
+
+Whether a negative value can appear on a real security is unknown. [Unconfirmed]
+
 ### The `Sell All` trap
 
 **This is the most expensive mistake available in this format.**
 
 `Sell All` and `Buy to Cover All` flatten the position unconditionally. The
-`Shares Owned` column on those rows cannot be used as a delta. Across 105 such
-rows in one real export:
+`Shares Owned` column on those rows cannot be used as a delta. Across every such
+row in one real export:
 
-| What `Shares Owned` contained | Rows |
+| What `Shares Owned` contained | How often |
 |---|---|
-| `0` — no information at all | 100 |
-| the exact pre-close balance | 4 |
-| the balance off by a rounding tail | 1 |
+| `0` — no information at all | the overwhelming majority |
+| the exact pre-close balance | a handful |
+| the balance off by a rounding tail | one |
 
 The same column, on the same transaction type, is filled two incompatible ways.
 Only the "flatten" reading works for both.
 
 Treating it as a delta corrupts the portfolio **silently**. In one measured case
-it produced phantom positions in **50 different instruments** — some going
+it produced phantom positions in **dozens of instruments** — some going
 negative (a nonexistent short position worth six figures), others left holding
 stock that had been fully sold, because subtracting the common `0` leaves the
 position untouched.
@@ -217,6 +281,14 @@ both to the same date, the difference between them was exactly the `Dividend
 Reinvest` row's `shares`. With direction +1 the two bookkeeping styles reconcile
 to 0.00; with −1 they diverge by twice the amount.
 
+⚠ **Evidence coverage on this type is thinner than on the others.** Every
+occurrence in the sample was that same usage — capitalising accrued interest into
+a principal. The type's ordinary purpose, an actual dividend being reinvested,
+was never observed at all. The `+1` direction rests on arithmetic reconciliation
+rather than on intent, so it should hold for either usage; but it has been
+confirmed against one usage pattern, not two. Treat it as weaker than the
+`Sell All` finding, which was confirmed from several directions.
+
 ## 5. `OutgoingCashLink`
 
 An `Id` pointing at the paired cash-side transaction. [Verified] The pairings that
@@ -236,7 +308,7 @@ This matches the official UI strings: `withdrawCashFromPortfolioToPurchase`,
 `depositCashToPortfolioFromSale`, and `portfolio_link_cashFound` ("Linked cash
 transaction found").
 
-⚠ **Coverage is low.** In the sample, only 248 of ~6,900 transactions carried a
+⚠ **Coverage is low.** In the sample, well under 5% of transactions carried a
 link — the cash leg of everything else was recorded by hand with no
 machine-readable relationship. Any cash-flow analysis built on this column alone
 will see a small fraction of the actual flows.
@@ -264,8 +336,8 @@ symbol lacks `=F`, verify before trusting the product. [Unconfirmed]
 
 **`Id` is only valid inside a single file.** [Verified]
 
-Comparing two exports taken two days apart: of the 6,575 transactions present in
-both, **1,022 (15.5%) had a different `Id`**.
+Comparing two exports taken two days apart: of the transactions present in both,
+**15.5% had a different `Id`**.
 
 Within a single block the Ids are usually stable — it is the file-level numbering
 that shifts, apparently because the export renumbers by internal ordering, so any
@@ -301,6 +373,21 @@ surfaced a row from six months earlier that had simply been renumbered.
    format cannot tell you which is which.
 7. **`Cost Per Share` on `Dividend` / `Interest` rows is meaningless** (§4).
 8. **`Id` is not a cross-file key** (§7).
+9. **A `(Portfolio, Symbol)` pair can occupy more than one block.** Seen in every
+   export of one sample: the same pair appearing twice, each with its own snapshot
+   row, one of the two carrying no transactions at all. Anything that keys on the
+   pair — a dict, a `GROUP BY` — silently drops one of them. Sum per *block*, not
+   per pair. The bundled parser reports this case instead of merging it away.
+10. **A transaction row with an empty `Transaction Date` would be indistinguishable
+    from a snapshot row.** The empty date is the only marker the format provides,
+    and there is no second signal to fall back on. Such a row would be read as a
+    snapshot and disappear from the position entirely. Never observed, but nothing
+    in the format prevents it. [Unconfirmed]
+11. **Number formatting is assumed to be `.` decimal separator, `,` thousands
+    separator.** This has not been checked on a device whose locale reverses the
+    two. If yours does, both the reference parser and several numeric claims in §2
+    need re-verification. To check: switch the device locale, re-export, and diff
+    against a known file. [Unconfirmed]
 
 ## Official references
 
